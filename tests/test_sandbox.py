@@ -173,6 +173,43 @@ def test_checkpoint_orphan_detection(tmp_path: Path) -> None:
     assert orphans == [rec_id_1]
 
 
+def test_sandbox_runs_pdhg_tv_end_to_end(tmp_path: Path) -> None:
+    """The eval_kernel subprocess can drive PDHG on a TV problem.
+
+    Validates the algorithm dispatch in `_eval_kernel.py`: when ``algorithm
+    = pdhg`` the eval calls the PDHG driver, returns gap as the kkt_final
+    field with ``fitness_kind="gap"``, and produces a converged x.
+    """
+    rng = np.random.default_rng(0)
+    n = 64
+    truth = np.cumsum(rng.standard_normal(n) * (rng.random(n) < 0.1))
+    b = truth + 0.1 * rng.standard_normal(n)
+    from convexkernels.frontend.total_variation import TVDenoising1D
+    prob = TVDenoising1D(b, lam=0.5)
+
+    run_dir = tmp_path / "run_pdhg"
+    write_eval_config(
+        run_dir,
+        prob,
+        kernel_module="convexkernels.kernels.numpy_pdhg_ref",
+        kernel_step="pdhg_step",
+        kernel_init="init_state",
+        algorithm="pdhg",
+        max_iters=5000,
+        tol=1e-7,
+    )
+    result = run_kernel(run_dir, timeout_s=30.0)
+
+    assert result.status == "completed", (
+        f"sandbox failed: {result.status} / {result.error_message} / "
+        f"stderr_tail={result.stderr_tail[-500:]}"
+    )
+    assert result.converged
+    assert result.kkt_final < 1e-6  # primal-dual gap stored in kkt_final field
+    raw = json.loads((run_dir / "result.json").read_text())
+    assert raw["fitness_kind"] == "gap"
+
+
 def test_lineage_round_trip(tmp_path: Path) -> None:
     lineage_path = tmp_path / "lineage.jsonl"
     slot = Slot("lasso", "fista", "m3_pro", "fp32")

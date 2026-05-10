@@ -14,8 +14,10 @@ import pytest
 
 from convexkernels.algorithms.fista import fista
 from convexkernels.algorithms.kkt import assert_equivalent
+from convexkernels.algorithms.pdhg import pdhg
 from convexkernels.frontend.lasso import Lasso
 from convexkernels.frontend.nonnegative_lasso import NonnegativeLasso
+from convexkernels.frontend.total_variation import TVDenoising1D
 
 _HAS_MLX = importlib.util.find_spec("mlx") is not None
 mlx_only = pytest.mark.skipif(not _HAS_MLX, reason="MLX not available on this host")
@@ -177,3 +179,47 @@ def test_mlx_nonnegative_seed_kernel_functional_equivalence_fp32():
     )
     print(f"nn fp32 mlx vs np: drift={diag['rel_drift']:.2e}, "
           f"kkt_mlx={diag['kkt_kernel']:.2e}, kkt_np={diag['kkt_ref']:.2e}")
+
+
+@mlx_only
+def test_mlx_pdhg_tv_seed_kernel_matches_numpy_reference():
+    """pdhg_step_v0 (mlx fp32) and the numpy PDHG reference reach the same
+    primal objective on a small TV-L2 1D problem.
+    """
+    from convexkernels.kernels.mlx.lib import TVDenoising1DMLX
+    from convexkernels.kernels.mlx.seeds.pdhg_step_v0 import (
+        init_state as mlx_init,
+        pdhg_step as mlx_step,
+    )
+    import mlx.core as mx
+
+    rng = np.random.default_rng(0)
+    n = 64
+    truth = np.cumsum(rng.standard_normal(n) * (rng.random(n) < 0.1))
+    b = truth + 0.1 * rng.standard_normal(n)
+    lam = 0.5
+    prob_np = TVDenoising1D(b, lam)
+    prob_mlx = TVDenoising1DMLX.from_problem(prob_np, dtype=mx.float32)
+
+    res_np = pdhg(prob_np, variant="basic", max_iters=5000, tol=1e-7)
+    res_mlx = pdhg(
+        prob_mlx, variant="basic", max_iters=5000, tol=1e-7,
+        kernel_step=mlx_step, kernel_init=mlx_init,
+    )
+
+    assert res_np.converged
+    assert res_mlx.converged
+
+    p_np = prob_np.primal_objective(np.asarray(res_np.x))
+    p_mlx = prob_np.primal_objective(np.asarray(res_mlx.x))
+    rel = abs(p_np - p_mlx) / max(abs(p_np), 1.0)
+    assert rel < 1e-3, f"primal mismatch: np={p_np:.6f} mlx={p_mlx:.6f} rel={rel:.3e}"
+
+    diag = {
+        "kkt_kernel": prob_np.primal_dual_gap(np.asarray(res_mlx.x), np.asarray(res_mlx.y)),
+        "kkt_ref":    prob_np.primal_dual_gap(np.asarray(res_np.x), np.asarray(res_np.y)),
+        "rel_drift":  float(np.max(np.abs(np.asarray(res_mlx.x) - np.asarray(res_np.x)))
+                            / max(np.max(np.abs(np.asarray(res_np.x))), 1.0)),
+    }
+    print(f"pdhg-tv1d fp32 mlx vs np: drift={diag['rel_drift']:.2e}, "
+          f"gap_mlx={diag['kkt_kernel']:.2e}, gap_np={diag['kkt_ref']:.2e}")

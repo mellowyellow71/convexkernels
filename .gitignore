@@ -24,3 +24,7 @@ runs/
 
 # Local data caches
 data/
+
+# One-off bench / re-eval outputs from scripts/
+baseline_pdhg_tv.json
+confirm_gram_champion.json

@@ -1,210 +1,208 @@
-"""Standalone synth-loop driver.
+"""CLI driver for the autoresearch loop.
 
 Usage:
-    python -m convexkernels.synth.run --n-proposals 3 --shape tall_small
+  python -m convexkernels.synth.run \\
+    --slot lasso/fista/apple_silicon/fp32 \\
+    --shape tall_medium \\
+    --seed convexkernels.kernels.mlx.seeds.fista_step_v0 \\
+    --proposer openai \\
+    --n-proposals 50 \\
+    --reps 5 \\
+    --state-root ./synth_run_$(date +%Y%m%d) \\
+    --program-md convexkernels/synth/program.md
 
-Reads OPENAI_API_KEY from env. Writes lineage + run artifacts under
-`./synth_run/` by default.
+Slot dispatch: `<problem_family>/<algorithm>/<hardware>/<dtype>`. Problem
+families: `lasso`, `nonneg_lasso`, `total_variation_1d`. Algorithms:
+`fista`, `pdhg`. Hardware tag is a free-form string (default = auto).
 """
-
 from __future__ import annotations
 
 import argparse
+import sys
 from pathlib import Path
 
-from ..bench.shapes import (
-    DEFAULT_SHAPES,
-    make_synthetic_lasso,
-    make_synthetic_nonnegative_lasso,
-)
 from .lineage import Slot
-from .loop import detect_hardware
+from .loop import detect_hardware, run_synth_loop
+from .proposers.openai import OpenAIProposer
+from .proposers.stub import StubProposer
 
 
-def main() -> int:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--n-proposals", type=int, default=3)
-    parser.add_argument("--shape", type=str, default="tall_small",
-                        choices=[s.name for s in DEFAULT_SHAPES])
-    parser.add_argument("--problem-family", type=str, default="lasso",
-                        choices=["lasso", "nonnegative_lasso"],
-                        help="Convex problem family to synthesize for.")
-    parser.add_argument("--state-root", type=str, default="./synth_run")
-    parser.add_argument("--tier1-tol", type=float, default=1e-3)
-    parser.add_argument("--tier1-max-iters", type=int, default=200)
-    parser.add_argument("--tier1-reps", type=int, default=3,
-                        help="Timed Tier-1 repetitions; median time is gated.")
-    parser.add_argument("--tier1-escalation-margin", type=float, default=1.0,
-                        help="For Tier-2/3 promotion, run Tier-2 when Tier-1 is below this fraction of champion Tier-1 time.")
-    parser.add_argument("--variant", type=str, default="restart",
-                        choices=["basic", "restart"],
-                        help="Host-side FISTA variant used during evaluation.")
-    parser.add_argument("--model", type=str, default="gpt-5.5")
-    parser.add_argument("--temperature", type=float, default=None,
-                        help="Optional sampling temperature. Omitted by default.")
-    parser.add_argument("--reasoning-effort", type=str, default="medium",
-                        choices=["none", "minimal", "low", "medium", "high", "xhigh"],
-                        help="Reasoning effort for OpenAI reasoning models.")
-    parser.add_argument("--api-timeout-s", type=float, default=180.0,
-                        help="Per-proposal OpenAI request timeout.")
-    parser.add_argument("--seed-kernel", type=str,
-                        default=None,
-                        help="Dotted module path of the seed kernel. Defaults by problem family.")
-    parser.add_argument("--timeout-s", type=float, default=60.0)
-    parser.add_argument("--proposer", type=str, default="openai",
-                        choices=["openai", "stub", "structured"])
-    parser.add_argument("--transfer-seed-k", type=int, default=0,
-                        help="Evaluate up to k accepted edits transferred from neighbor slots before asking the proposer.")
-    parser.add_argument("--dtype", type=str, default="fp32",
-                        choices=["fp32", "fp16"],
-                        help="Problem dtype for MLX-backed kernel evaluation.")
-    parser.add_argument("--dtype-strategy", type=str, default="fp32",
-                        choices=["fp32", "fp16_storage", "mixed_gram"],
-                        help="Dtype strategy label for dtype-search experiments.")
-    parser.add_argument("--gradient-strategy", type=str, default="direct",
-                        choices=["direct", "gram"],
-                        help="FISTA gradient path to use when choosing the default seed.")
-    parser.add_argument("--cost-model", type=str, default="single",
-                        choices=["single", "amortized", "both"],
-                        help="Timing metric used for speed gates; 'both' logs both and gates on single-solve time.")
-    parser.add_argument("--warmup-runs", type=int, default=1,
-                        help="Untimed warmup evaluations before the timed Tier-1 run.")
-    parser.add_argument("--speedup-margin", type=float, default=0.95,
-                        help="Keep only proposals below this fraction of champion wall time.")
-    parser.add_argument("--no-speed-gate", action="store_true",
-                        help="Debug mode: accept KKT-valid proposals even if slower.")
-    parser.add_argument("--promotion-tier", type=str, default="tier1",
-                        choices=["tier1", "tier2", "tier3"],
-                        help="Highest tier required before champion promotion.")
-    parser.add_argument("--tier2-shape", type=str, default="tall_medium",
-                        choices=[s.name for s in DEFAULT_SHAPES])
-    parser.add_argument("--tier2-tol", type=float, default=1e-6)
-    parser.add_argument("--tier2-max-iters", type=int, default=5000)
-    parser.add_argument("--tier2-reps", type=int, default=3,
-                        help="Timed Tier-2 repetitions; median time is gated.")
-    parser.add_argument("--tier2-speed-margin", type=float, default=0.97,
-                        help="For Tier-2/3 promotion, require convergence time below this fraction of champion Tier-2 time.")
-    parser.add_argument("--no-tier2-speed-gate", action="store_true",
-                        help="Debug mode: Tier-2 checks convergence only, not speed.")
-    parser.add_argument("--no-tier2-confirm-speed", action="store_true",
-                        help="Debug mode: skip paired champion remeasurement before Tier-2 speed promotion.")
-    parser.add_argument("--tier3-shapes", type=str, default="tall_small,wide_small",
-                        help="Comma-separated shape names for Tier-3.")
-    parser.add_argument("--tier3-tol", type=float, default=1e-6)
-    parser.add_argument("--tier3-max-iters", type=int, default=5000)
-    parser.add_argument("--tier3-reps", type=int, default=3)
-    args = parser.parse_args()
-
-    spec = next(s for s in DEFAULT_SHAPES if s.name == args.shape)
-    shape_by_name = {s.name: s for s in DEFAULT_SHAPES}
-    problem_factory = (
-        make_synthetic_nonnegative_lasso
-        if args.problem_family == "nonnegative_lasso"
-        else make_synthetic_lasso
+def _make_problem(problem_family: str, shape_name: str):
+    """Construct a problem instance for the chosen family + bench shape."""
+    from ..bench.shapes import (
+        DEFAULT_SHAPES,
+        DEFAULT_TV1D_SHAPES,
+        make_synthetic_lasso,
+        make_synthetic_nonnegative_lasso,
+        make_synthetic_tv_1d,
     )
-    problem = problem_factory(spec, seed=0)
-    tier2_problem = problem_factory(shape_by_name[args.tier2_shape], seed=0)
-    tier3_shapes = tuple(
-        shape_by_name[name.strip()]
-        for name in args.tier3_shapes.split(",")
-        if name.strip()
+    from ..bench.eq_qp_shapes import (
+        DEFAULT_BP_SHAPES,
+        DEFAULT_EQ_QP_SHAPES,
+        make_synthetic_basis_pursuit,
+        make_synthetic_eq_qp,
     )
-    problem_backend = "native"
-    slot_dtype = "fp64"
-    problem_dtype = args.dtype
-    if args.dtype_strategy == "fp16_storage":
-        problem_dtype = "fp16"
-    elif args.dtype_strategy == "mixed_gram":
-        problem_dtype = "fp32"
 
-    seed_kernel_module = args.seed_kernel
-    if seed_kernel_module is None:
-        if args.problem_family == "nonnegative_lasso":
-            seed_kernel_module = "convexkernels.kernels.mlx.seeds.nonnegative_fista_step_v0"
-        elif args.gradient_strategy == "gram":
-            seed_kernel_module = "convexkernels.kernels.mlx.seeds.gram_fista_step_v0"
-        else:
-            seed_kernel_module = "convexkernels.kernels.mlx.seeds.fista_step_v0"
+    if problem_family in {"lasso", "nonneg_lasso", "lasso_admm"}:
+        spec = next((s for s in DEFAULT_SHAPES if s.name == shape_name), None)
+        if spec is None:
+            raise ValueError(f"unknown lasso shape {shape_name!r}; pick from {[s.name for s in DEFAULT_SHAPES]}")
+        if problem_family == "lasso":
+            return make_synthetic_lasso(spec)
+        if problem_family == "nonneg_lasso":
+            return make_synthetic_nonnegative_lasso(spec)
+        # lasso_admm: build the regular Lasso then wrap.
+        from ..frontend.lasso_admm import LassoAdmm
+        base = make_synthetic_lasso(spec)
+        return LassoAdmm(base.A, base.b, base.lam)
+    if problem_family == "total_variation_1d":
+        spec = next((s for s in DEFAULT_TV1D_SHAPES if s.name == shape_name), None)
+        if spec is None:
+            raise ValueError(f"unknown tv1d shape {shape_name!r}; pick from {[s.name for s in DEFAULT_TV1D_SHAPES]}")
+        return make_synthetic_tv_1d(spec)
+    if problem_family == "equality_qp":
+        spec = next((s for s in DEFAULT_EQ_QP_SHAPES if s.name == shape_name), None)
+        if spec is None:
+            raise ValueError(f"unknown equality_qp shape {shape_name!r}; pick from {[s.name for s in DEFAULT_EQ_QP_SHAPES]}")
+        return make_synthetic_eq_qp(spec)
+    if problem_family == "basis_pursuit":
+        spec = next((s for s in DEFAULT_BP_SHAPES if s.name == shape_name), None)
+        if spec is None:
+            raise ValueError(f"unknown basis_pursuit shape {shape_name!r}; pick from {[s.name for s in DEFAULT_BP_SHAPES]}")
+        return make_synthetic_basis_pursuit(spec)
+    raise ValueError(f"unknown problem_family {problem_family!r}")
 
-    if ".mlx." in seed_kernel_module:
-        problem_backend = "mlx"
-        slot_dtype = args.dtype_strategy
+
+def _default_seed_kernel(problem_family: str, algorithm: str, backend: str) -> dict:
+    """Resolve a seed kernel module/step/init by (problem_family, algorithm, backend)."""
+    if backend == "mlx":
+        if problem_family == "lasso" and algorithm == "fista":
+            return {"module": "convexkernels.kernels.mlx.seeds.fista_step_v0",
+                    "step": "fista_step", "init": "init_state"}
+        if problem_family == "nonneg_lasso" and algorithm == "fista":
+            return {"module": "convexkernels.kernels.mlx.seeds.nonnegative_fista_step_v0",
+                    "step": "fista_step", "init": "init_state"}
+        if problem_family == "total_variation_1d" and algorithm == "pdhg":
+            return {"module": "convexkernels.kernels.mlx.seeds.pdhg_step_v0",
+                    "step": "pdhg_step", "init": "init_state"}
+        if problem_family == "basis_pursuit" and algorithm == "pdhg":
+            return {"module": "convexkernels.kernels.mlx.seeds.pdhg_bp_step_v0",
+                    "step": "pdhg_step", "init": "init_state"}
+        if problem_family == "equality_qp" and algorithm == "alm":
+            return {"module": "convexkernels.kernels.mlx.seeds.alm_step_v0",
+                    "step": "alm_step", "init": "init_state"}
+        if problem_family == "lasso_admm" and algorithm == "admm":
+            return {"module": "convexkernels.kernels.mlx.seeds.admm_lasso_step_v0",
+                    "step": "admm_step", "init": "init_state"}
+    elif backend == "native":
+        if algorithm == "fista":
+            return {"module": "convexkernels.kernels.numpy_ref",
+                    "step": "fista_step", "init": "init_state"}
+        if algorithm == "pdhg":
+            return {"module": "convexkernels.kernels.numpy_pdhg_ref",
+                    "step": "pdhg_step", "init": "init_state"}
+        if algorithm == "alm":
+            return {"module": "convexkernels.kernels.numpy_alm_ref",
+                    "step": "alm_step", "init": "init_state"}
+        if algorithm == "admm":
+            return {"module": "convexkernels.kernels.numpy_admm_ref",
+                    "step": "admm_step", "init": "init_state"}
+    raise ValueError(f"no default seed for ({problem_family}, {algorithm}, backend={backend})")
+
+
+def _parse_slot_spec(slot_str: str) -> Slot:
+    parts = slot_str.split("/")
+    if len(parts) != 4:
+        raise ValueError(f"slot must be problem_family/algorithm/hardware/dtype, got {slot_str!r}")
+    pf, algo, hw, dt = parts
+    if hw == "auto":
+        hw = detect_hardware()
+    return Slot(problem_family=pf, algorithm=algo, hardware=hw, dtype=dt)
+
+
+def main(argv: list[str] | None = None) -> int:
+    p = argparse.ArgumentParser()
+    p.add_argument("--slot", required=True, help="problem_family/algorithm/hardware/dtype")
+    p.add_argument("--shape", required=True, help="bench shape name (e.g. tall_medium, tv1d_medium)")
+    p.add_argument("--seed", default=None, help="seed kernel module dotted-path (auto if omitted)")
+    p.add_argument("--seed-step", default=None, help="seed kernel step function name")
+    p.add_argument("--seed-init", default=None, help="seed kernel init function name")
+    p.add_argument("--default-step-name", default=None, help=argparse.SUPPRESS)
+    p.add_argument("--proposer", choices=["openai", "stub"], default="openai")
+    p.add_argument("--model", default="gpt-5.5", help="OpenAI model name")
+    p.add_argument("--reasoning-effort", default="medium")
+    p.add_argument("--api-timeout-s", type=float, default=240.0)
+    p.add_argument("--n-proposals", type=int, default=50)
+    p.add_argument("--reps", type=int, default=5)
+    p.add_argument("--max-iters", type=int, default=5000)
+    p.add_argument("--fitness-tol", type=float, default=1e-6)
+    p.add_argument("--speedup-margin", type=float, default=0.97)
+    p.add_argument("--variant", default="basic")
+    p.add_argument("--problem-backend", choices=["native", "mlx"], default="mlx")
+    p.add_argument("--problem-dtype", choices=["fp32", "fp16"], default="fp32")
+    p.add_argument("--cost-model", choices=["single", "amortized"], default="single")
+    p.add_argument("--warmup-runs", type=int, default=1)
+    p.add_argument("--timeout-s", type=float, default=120.0)
+    p.add_argument("--state-root", required=True, type=Path)
+    p.add_argument("--program-md", default="convexkernels/synth/program.md", type=Path)
+    p.add_argument("--verbose", action="store_true", default=True)
+    args = p.parse_args(argv)
+
+    slot = _parse_slot_spec(args.slot)
+    problem = _make_problem(slot.problem_family, args.shape)
+    if args.seed is None:
+        seed_kernel = _default_seed_kernel(
+            slot.problem_family, slot.algorithm, args.problem_backend,
+        )
+    else:
+        default_step = {"pdhg": "pdhg_step", "alm": "alm_step", "admm": "admm_step"}.get(slot.algorithm, "fista_step")
+        seed_kernel = {
+            "module": args.seed,
+            "step": args.seed_step or default_step,
+            "init": args.seed_init or "init_state",
+        }
+    program_md = ""
+    if args.program_md and args.program_md.exists():
+        program_md = args.program_md.read_text()
 
     if args.proposer == "openai":
-        from .proposers.openai import OpenAIProposer
         proposer = OpenAIProposer(
             model=args.model,
-            temperature=args.temperature,
             reasoning_effort=args.reasoning_effort,
             api_timeout_s=args.api_timeout_s,
         )
-    elif args.proposer == "structured":
-        from .proposers.structured import StructuredGridProposer
-        proposer = StructuredGridProposer()
     else:
-        from .proposers.stub import DeterministicStubProposer
-        proposer = DeterministicStubProposer()
+        proposer = StubProposer([])
 
-    from .loop import run_synth_loop
-    appended = run_synth_loop(
+    rows = run_synth_loop(
         proposer=proposer,
         problem=problem,
-        seed_kernel={
-            "module": seed_kernel_module,
-            "step": "fista_step",
-            "init": "init_state",
-        },
+        seed_kernel=seed_kernel,
+        slot=slot,
+        state_root=args.state_root,
         n_proposals=args.n_proposals,
-        state_root=Path(args.state_root),
-        shape_name=args.shape,
-        slot=Slot(
-            problem_family=args.problem_family,
-            algorithm="fista",
-            hardware=detect_hardware(),
-            dtype=slot_dtype,
-        ) if ".mlx." in seed_kernel_module else None,
-        problem_backend=problem_backend,
-        problem_dtype=problem_dtype,
-        dtype_strategy=args.dtype_strategy,
-        cost_model=args.cost_model,
-        algorithm_variant=args.variant,
-        warmup_runs=args.warmup_runs,
-        require_speedup=not args.no_speed_gate,
+        algorithm=slot.algorithm,
+        variant=args.variant,
+        fitness_tol=args.fitness_tol,
+        max_iters=args.max_iters,
+        reps=args.reps,
         speedup_margin=args.speedup_margin,
-        promotion_tier=args.promotion_tier,
-        tier2_problem=tier2_problem,
-        tier2_kkt_tol=args.tier2_tol,
-        tier2_max_iters=args.tier2_max_iters,
-        tier2_reps=args.tier2_reps,
-        require_tier2_speed=not args.no_tier2_speed_gate,
-        tier2_speed_margin=args.tier2_speed_margin,
-        confirm_tier2_speed=not args.no_tier2_confirm_speed,
-        tier3_shapes=tier3_shapes,
-        tier3_kkt_tol=args.tier3_tol,
-        tier3_max_iters=args.tier3_max_iters,
-        tier3_reps=args.tier3_reps,
-        transfer_seed_k=args.transfer_seed_k,
-        tier1_kkt_tol=args.tier1_tol,
-        tier1_max_iters=args.tier1_max_iters,
-        tier1_reps=args.tier1_reps,
-        tier1_escalation_margin=args.tier1_escalation_margin,
+        problem_backend=args.problem_backend,
+        problem_dtype=args.problem_dtype,
+        cost_model=args.cost_model,
+        warmup_runs=args.warmup_runs,
         timeout_s=args.timeout_s,
-        verbose=True,
+        program_md=program_md,
+        verbose=args.verbose,
     )
 
-    accepted = [r for r in appended if r["decision"]["accepted"]]
-    print()
-    print("=== summary ===")
-    print(f"problem: {args.problem_family}")
-    print(f"shape: {spec.name} (m={spec.m}, n={spec.n})")
-    print(f"proposer: {args.proposer} (model: {args.model})")
-    print(f"proposals: {len(appended)}")
-    print(f"accepted: {len(accepted)}")
-    if accepted:
-        for r in accepted:
-            print(f"  - {r['edit']['type']}: {r['tier1']['wall_time_ms']:.1f}ms")
+    accepted = sum(1 for r in rows if r.decision.get("accepted"))
+    discarded = len(rows) - accepted
+    print(f"\nsession complete: {accepted} kept / {discarded} discarded across {len(rows)} proposals")
+    print(f"lineage: {args.state_root}/lineage.jsonl")
+    print(f"champion source: {args.state_root}/champion.py")
     return 0
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    sys.exit(main())

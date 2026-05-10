@@ -51,8 +51,19 @@ def _prepare_problem(prob, config: dict):
 
     import mlx.core as mx
 
+    from convexkernels.frontend.basis_pursuit import BasisPursuit
+    from convexkernels.frontend.equality_qp import EqualityQP
+    from convexkernels.frontend.lasso_admm import LassoAdmm
     from convexkernels.frontend.nonnegative_lasso import NonnegativeLasso
-    from convexkernels.kernels.mlx.lib import LassoMLX, NonnegativeLassoMLX
+    from convexkernels.frontend.total_variation import TVDenoising1D
+    from convexkernels.kernels.mlx.lib import (
+        BasisPursuitMLX,
+        EqualityQPMLX,
+        LassoAdmmMLX,
+        LassoMLX,
+        NonnegativeLassoMLX,
+        TVDenoising1DMLX,
+    )
 
     dtype_name = config.get("problem_dtype", "fp32")
     dtype = {
@@ -61,6 +72,14 @@ def _prepare_problem(prob, config: dict):
     }[dtype_name]
     if isinstance(prob, NonnegativeLasso):
         return NonnegativeLassoMLX.from_problem(prob, dtype=dtype)
+    if isinstance(prob, TVDenoising1D):
+        return TVDenoising1DMLX.from_problem(prob, dtype=dtype)
+    if isinstance(prob, EqualityQP):
+        return EqualityQPMLX.from_problem(prob, dtype=dtype)
+    if isinstance(prob, BasisPursuit):
+        return BasisPursuitMLX.from_problem(prob, dtype=dtype)
+    if isinstance(prob, LassoAdmm):
+        return LassoAdmmMLX.from_problem(prob, dtype=dtype)
     return LassoMLX.from_lasso(prob, dtype=dtype)
 
 
@@ -87,30 +106,70 @@ def main(run_dir: str) -> int:
         kernel_step = getattr(kernel_module, config["kernel_step"])
         kernel_init = getattr(kernel_module, config["kernel_init"])
 
-        from convexkernels.algorithms.fista import fista
-        fista_kwargs = {
+        algorithm = config.get("algorithm", "fista")
+        # Record history (= trajectory of KKT or gap) for the final timed run
+        # so the proposer can see *where* convergence stalled or diverged.
+        # convergence_check_every reduces per-iter GPU sync overhead from
+        # checking the convergence criterion every iteration; defaults to 10
+        # for sandbox runs, can be overridden via eval_config.
+        algo_kwargs = {
             "max_iters": config.get("max_iters", 200),
             "tol": config.get("tol", 1e-6),
             "variant": config.get("variant", "basic"),
             "kernel_step": kernel_step,
             "kernel_init": kernel_init,
-            "record_history": False,
+            "record_history": True,
+            "convergence_check_every": int(config.get("convergence_check_every", 10)),
         }
-        for _ in range(config.get("warmup_runs", 0)):
-            fista(prob, **fista_kwargs)
+        if algorithm == "fista":
+            from convexkernels.algorithms.fista import fista as _driver
+            fitness_attr = "kkt_final"
+        elif algorithm == "pdhg":
+            from convexkernels.algorithms.pdhg import pdhg as _driver
+            fitness_attr = "gap_final"
+        elif algorithm == "alm":
+            from convexkernels.algorithms.alm import alm as _driver
+            # ALM reports primal+dual residuals; we surface primal_res_final
+            # as the gating fitness (it is the constraint-violation magnitude
+            # that goes to zero at the optimum and serves as the
+            # KKT-equivalent oracle-free signal for equality-constrained QP).
+            fitness_attr = "primal_res_final"
+        elif algorithm == "admm":
+            from convexkernels.algorithms.admm import admm as _driver
+            # ADMM gates on max(primal_res, dual_res) — both must be small.
+            fitness_attr = "primal_res_final"
+        else:
+            raise ValueError(f"unknown algorithm {algorithm!r}; expected fista, pdhg, alm, or admm")
 
-        res = fista(
-            prob,
-            **fista_kwargs,
-        )
+        for _ in range(config.get("warmup_runs", 0)):
+            _driver(prob, **algo_kwargs)
+
+        res = _driver(prob, **algo_kwargs)
         solve_time_s = float(res.wall_time_s)
         single_solve_time_s = float(setup_time_s + solve_time_s)
 
         np.save(run_path / "x.npy", np.asarray(res.x))
+
+        # Compress the per-iter fitness trajectory and write alongside the
+        # result so the synth loop's proposer-context builder can read it
+        # cheaply. The full history can be huge (thousands of iters); only
+        # the compressed series goes to the LLM prompt.
+        history = getattr(res, "history", {}) or {}
+        traj_key = {"fista": "kkt", "pdhg": "gap", "alm": "primal_res", "admm": "primal_res"}.get(algorithm, "kkt")
+        traj = list(history.get(traj_key, []))
+        if traj:
+            (run_path / "trajectory.json").write_text(json.dumps(traj))
+
+        # KKT/gap reported as kkt_final regardless of algorithm so the synth
+        # loop's gating logic stays uniform. Algorithms that produce a primal-
+        # dual gap rather than a KKT residual write it to the same field;
+        # acceptance gates apply identically.
+        fitness_value = float(getattr(res, fitness_attr))
         result = {
             "status": "completed",
             "iters": int(res.n_iters),
-            "kkt_final": float(res.kkt_final),
+            "kkt_final": fitness_value,
+            "fitness_kind": "gap" if algorithm == "pdhg" else "kkt",
             "wall_time_s": single_solve_time_s,
             "setup_time_s": float(setup_time_s),
             "solve_time_s": solve_time_s,

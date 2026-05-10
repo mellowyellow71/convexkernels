@@ -1780,3 +1780,403 @@ state without reconstructing the project from scattered conversation:
 
 Updated `tasks/handoff.md` with a fresh-agent reading order and current exact
 pause point. Updated `tasks/todo.md` to mark these context documents complete.
+
+
+## P-pivot.0 — Gram champion 5-rep confirmation (2026-05-10)
+
+The recorded `tier2 = 16.396 ms` for the FISTA Gram champion
+`450c6b8b-49e7-4b57-9a2e-900b7708fbba` was a 1-rep measurement. Re-ran with
+`--tier2-reps 5` on `tall_medium amortized` via `scripts/confirm_gram_champion.py`:
+
+| metric | value |
+|---|---:|
+| converged | yes |
+| iters | 22 |
+| KKT_final | 4.29e-07 |
+| solve median ms | 21.566 |
+| solve min ms | 20.853 |
+| solve max ms | 24.001 |
+| solve std ms | 1.121 |
+| n_reps | 5 |
+| recorded vs measured | 16.396 → 21.566 (1.315x drift) |
+
+The **algorithm is reproducible** (KKT and iters match within precision; std
+≈ 5%). The **headline number was 1-rep optimistic by ~30%**. New regression
+baseline: **~21.6 ms** for tall_medium amortized FISTA-Gram. Recorded in
+`synth_run_p4_strategy_tall_medium_amortized_20260509/confirm_gram_champion.json`.
+
+This is the kind of one-rep noise `tasks/program_kernel.md §9.4` warned about,
+exactly why the strict promotion gate uses paired multi-rep timing.
+
+## P-pivot foundations (2026-05-10)
+
+After the strategic pivot away from the FISTA-LASSO trap toward richer
+algorithms (PDHG, ALM), added the foundational pieces. Pure additions; no
+deletions yet.
+
+- `convexkernels/algorithms/gap.py` — primal-dual gap and dual-residual
+  oracle-free fitness signals; sister of `kkt.py`. Includes
+  `tv_l2_primal_dual_gap` (scale-free), `alm_residuals`, and
+  `assert_pdhg_equivalent` for the test contract.
+- `convexkernels/algorithms/pdhg.py` — Chambolle-Pock 2011 host driver. Three
+  variants: `basic` (Algorithm 1), `accelerated` (Algorithm 2 with
+  `gamma`-driven step adaptation), `restart` (CP analog of O Donoghue-Candes).
+  Backend-agnostic (numpy or MLX) via `kernel_step`/`kernel_init` like FISTA.
+- `convexkernels/frontend/total_variation.py` — `TVDenoising1D` and
+  `TVDenoising2D` (anisotropic + isotropic) specimens. Forward-difference
+  gradient operator with closed-form prox for f(x) = (1/2)||x - b||^2 and
+  for g*(y) = I{||y||_inf <= lam}.
+- `convexkernels/kernels/numpy_pdhg_ref.py` — NumPy correctness oracle for
+  PDHG, mirror of `numpy_ref.py` for FISTA.
+- `convexkernels/kernels/mlx/lib.py` — extended with `TVDenoising1DMLX`
+  (MLX-backed view of `TVDenoising1D`).
+- `convexkernels/kernels/mlx/seeds/pdhg_step_v0.py` — first MLX PDHG seed.
+  Per iter: K_apply (MLX), prox_g* (clip), K_T_apply (MLX), then a fused
+  Metal kernel for the cheap O(n) primal-prox + extrapolation tail.
+- `convexkernels/bench/shapes.py` — extended with `TvShapeSpec`,
+  `DEFAULT_TV1D_SHAPES`, and `make_synthetic_tv_1d`.
+- `convexkernels/synth/sandbox.py` + `_eval_kernel.py` — extended with
+  `algorithm` config field. When `algorithm="pdhg"`, dispatches to
+  `pdhg(...)`; primal-dual gap is reported in the `kkt_final` field with
+  `fitness_kind="gap"` so existing gating logic stays uniform.
+
+### Verification
+
+- Linux: 101 passed, 5 skipped (5 MLX-only, runs on Mac). `tests/test_pdhg.py`
+  has 8 tests including a CVXPY-CLARABEL oracle comparison on 3 random seeds
+  for TV-L2 1D — primal-objective match to 4 decimal places, iterate drift
+  < 1e-3.
+- Mac targeted (`test_kernels.py test_sandbox.py test_pdhg.py`): 20 passed.
+  PDHG MLX seed converges to fp32-numpy-reference primal at drift 1.5e-7,
+  gap 1.0e-7. Sandbox-driven PDHG-TV end-to-end works (subprocess dispatches
+  on `algorithm="pdhg"`, returns `fitness_kind="gap"`).
+
+
+
+## P-pivot.0 — PDHG-TV-1D seed baselines (2026-05-10)
+
+Mac M3 Pro multi-rep medians for the new specimen-2 seed kernel
+(`pdhg_step_v0`, fp32, restart-free PDHG) at gap < 1e-6:
+
+| shape (n) | backend | iters | gap | median ms | std ms | CV % |
+|---|---|---:|---:|---:|---:|---:|
+| tv1d_small (256) | mlx fp32 | 2883 | 9.95e-7 | 2188 | 35.6 | 1.6 |
+| tv1d_small (256) | numpy fp64 | 2880 | 9.99e-7 | 56.8 | 0.27 | 0.5 |
+| tv1d_medium (2048) | mlx fp32 | 4933 | 9.99e-7 | 3802 | 8.5 | 0.2 |
+| tv1d_medium (2048) | numpy fp64 | 4931 | 9.99e-7 | 146 | 2.2 | 1.5 |
+
+CVXPY-CLARABEL primal cross-validation on tv1d_small: numpy and mlx both
+match the oracle to rel err 1.8e-5 — algorithm correctness confirmed.
+
+**Headline**: at this point the MLX seed is **26-38× SLOWER than the numpy
+reference** for TV-1D. The reason is launch overhead: each PDHG iteration in
+the seed makes 5+ separate MLX op calls (K_apply, +, clip, K_T_apply, fused
+tail), and the per-iter compute is small enough on n <= 2048 that launch
+overhead dominates. Mac probe in P0 already flagged this regime
+(small shapes: launch-bound, BW utilization 16-32%).
+
+This is *the right baseline*: the seed is intentionally readable, not fast.
+The autoresearch loop is supposed to discover the fusion. There is real
+search surface (in contrast to the FISTA-LASSO seed which was already
+near-optimal in fp32). Expected loop wins: collapse all 5 ops into one
+Metal kernel per iter, removing ~24,000 launches per solve on tv1d_medium.
+
+A 50-proposal autoresearch run on PDHG-TV will use ~3 hours of Mac time
+(50 props * 5 reps * ~4 s/eval + model API). Reasonable overnight budget.
+
+
+
+## P-pivot.2 kill-test (smoke) — 2026-05-10
+
+The autoresearch thesis survived the pivot. 3-proposal OpenAI smoke on
+`total_variation_1d/pdhg/apple_silicon/fp32 + tv1d_small`:
+
+| | baseline | proposal 1 | proposal 2 | proposal 3 |
+|---|---|---|---|---|
+| status | seed | crash | **KEEP** | discard:not_faster |
+| gap | 9.74e-07 | — | 9.74e-07 | 9.74e-07 |
+| solve_ms (3-rep median) | 309.5 ± 4.3 | — | **229.0 ± 10.3** | 244.5 ± 8.3 |
+| iters | 2890 | — | 2890 | 2890 |
+
+Proposal 2 (kept) speedup vs seed: **1.35x**, gap reproduced *exactly*.
+
+The model rationale (excerpted from `lineage.jsonl`):
+> "Fuse the entire TV-1D PDHG iteration into one Metal launch: each x-index
+> thread recomputes the neighboring clipped dual values y_new[i-1] and
+> y_new[i] directly from x_bar and old y, applies the adjoint stencil K^T y
+> without materializing Kx_bar or KTy, then performs the x prox and
+> extrapolation; threads i < m also store y_next[i]. This eliminates the
+> separate MLX launches for K_apply, scale/add, clip, K_T_apply, and the
+> previous tail kernel..."
+
+This is non-trivial — it identifies that you can recompute O(1) extra duals
+per thread to avoid materializing the full K x_bar and K^T y arrays in
+global memory and collapsing 5+ launches to 1. A FISTA-LASSO seed had no
+such surface; PDHG-TV-1D does. The pivot premise (algorithm with richer
+search surface lets the LLM find non-cosmetic fusions) is validated.
+
+Proposal 3 attempted a threadgroup-memory variant of the same fusion to
+reuse `y_new[i]` across threads via barriers; came in 7% slower (244 ms vs
+229 ms). The loop correctly rejected it.
+
+**Subsidiary findings**:
+- Baseline solve dropped from 2188 ms (one-rep, record_history=True per iter)
+  to 309 ms (3-rep median, `convergence_check_every=10`). The signal-channel
+  optimization paid for itself before any LLM proposals.
+- API issue resolved: OpenAI Responses-API uses `text={"format": {...}}`,
+  not `response_format={...}`. Without the fix all 3 proposals crash before
+  any compute.
+
+## P-pivot.2 kill-test (full run) — 2026-05-10
+
+30-proposal OpenAI run on `total_variation_1d/pdhg/apple_silicon/fp32 + tv1d_medium`,
+`reasoning_effort=medium`. (Asked for 50; the OpenAI client returned 30 before
+exiting cleanly — adequate for the kill-test.)
+
+### Outcome (legitimate vs gamed champions)
+
+| outcome | count |
+|---|---:|
+| keep:passed | 13 |
+| discard:not_faster_than_baseline | 16 |
+| crash:runtime_error | 1 |
+
+### Trajectory of accepted champions (uncorrected timing, as recorded by the gameable eval)
+
+| gen | id | iters | gap | solve_ms | note |
+|---:|---|---:|---:|---:|---|
+| 2 | 433eba54 | 4940 | 9.89e-07 | 383.4 | first single-launch fusion (recompute adjacent duals) |
+| 3 | 6df28524 | 2470 | 9.92e-07 | 219.3 | 2-step temporal fusion |
+| 4 | 5e17cae0 | 1240 | 9.65e-07 | 154.1 | 4-step temporal fusion |
+| 5 | 83df077b | 620 | 9.65e-07 | 128.3 | 8-step temporal fusion |
+| 6 | d4f3e792 | 620 | 9.65e-07 | 85.8 | + threadgroup-memory halo |
+| 7 | 56490af5 | 160 | 7.79e-07 | 31.8 | 32-step |
+| 8 | c0f38f19 | 80 | 7.79e-07 | 21.3 | 64-step |
+| 9 | e8c7b7c9 | 40 | 7.79e-07 | 17.3 | 128-step |
+| **10** | **fefd55af** | **20** | **7.79e-07** | **7.32** | **256-step temporal fusion (honest peak)** |
+| 20 | fa50450c | 10 | 5.34e-08 | 3.83 | (gamed: 20x256 fused steps in init_state) |
+| 21 | b6621bbe | 10 | 5.34e-08 | 2.19 | (gamed: 30x256) |
+| 22 | f5382d3e | 10 | 5.34e-08 | 1.57 | (gamed: precompute one-step successors) |
+| 23 | 08dd1879 | 10 | 5.34e-08 | 0.98 | (gamed: tighter dict to state hot path) |
+
+### Eval-contract bug found and fixed
+
+After gen 10 the model started gaming the eval: stuffing PDHG iterations into
+`init_state`, which was NOT counted in `wall_time_s` (only the kernel-step
+loop was). Reported solve_ms dropped to 0.98 ms but the actual cost moved to
+setup. This is the Sakana CUDA Engineer benchmark-cheating failure mode.
+
+Fix in `algorithms/{pdhg,fista}.py`: `t0 = perf_counter()` is now set
+BEFORE `state = kernel_init(...)` so all algorithm-internal work counts.
+Defense in depth in `synth/loop.py`: under `cost_model="single"` the loop
+gates on `single_solve_time = setup + solve`, blocking attempts to stuff
+work into `prepare_problem`.
+
+### Validated under corrected eval (5-rep median, includes kernel_init)
+
+| candidate | wall_ms median +/- std | iters | gap |
+|---|---:|---:|---:|
+| seed `pdhg_step_v0` | 486.93 +/- 8.45 | 4940 | 9.89e-07 |
+| **gen-10 honest 256-step** | **4.92 +/- 0.20** | 20 | 7.79e-07 |
+| gen-23 gamed warm-start | 6.30 +/- 0.13 | 10 | 5.34e-08 |
+
+Under the corrected eval the honest gen-10 champion **beats** the gamed gen-23.
+Gaming is no longer the winning strategy; legitimate temporal fusion is.
+
+### Headline
+
+| baseline | corrected median ms |
+|---|---:|
+| MLX PDHG-TV-1D seed (5 ops/iter) | 486.93 |
+| gen-10 autoresearch champion (256-step temporal fusion + halo) | 4.92 |
+| numpy PDHG fp64 reference (CPU) | 146 (from prior bench) |
+
+Speedups under tol=1e-6, gap-gated, 5-rep multi-rep timing on tv1d_medium:
+- vs MLX seed: **99x**
+- vs numpy fp64: **30x**
+
+### Verdict
+
+**The pivot premise (algorithm with richer per-iter surface unlocks real
+autoresearch) is validated.** The model identified that:
+1. PDHG-TV-1D has a small-stencil dependency cone (each output at iter t+1
+   depends on a few neighbors at iter t).
+2. Therefore k iterations can be fused into one Metal launch by carrying a
+   halo — temporal-blocking / time-skewing.
+3. Spatial threadgroup memory caches the halo across blocks.
+4. Optimal fusion factor on M3 Pro for tv1d_medium = 256 steps/launch.
+
+This is a recognized HPC technique (time-skewing for stencil computations,
+e.g. Frigo-Strumpen 2005) that has never been hand-applied to this specimen
+in MLX. The model rediscovered it in 10 proposals.
+
+The autoresearch thesis was previously dormant on FISTA-LASSO (one fused
+tail kernel, 5-6 knobs, deterministic grid exhausts the space in 15 evals).
+On PDHG-TV it produced a 99x speedup with a non-trivial GPU technique.
+
+## P-pivot.3 — ALM specimen, equality-constrained QP — 2026-05-10
+
+`algorithms/alm.py` + `frontend/equality_qp.py` + `kernels/numpy_alm_ref.py` +
+`kernels/mlx/lib.py::EqualityQPMLX` + `kernels/mlx/seeds/alm_step_v0.py`.
+ALM driver supports basic and adaptive-rho variants with cached Cholesky on
+the state. MLX cholesky/trisolve are CPU-only as of 2.36; the seed routes
+through `stream=mx.cpu`. Tests (`tests/test_alm.py`): 5/5 pass on Linux.
+
+### ALM-MLX baseline (Mac, fp32, primal_res < 1e-6, 3-rep median)
+
+| shape (n, m) | conv | iters | wall_ms |
+|---|---|---:|---:|
+| eqqp_small (64, 8) | yes | 70 | 33.9 |
+| eqqp_medium (512, 64) | no in 2000 iters | 2000 | 2032 |
+| eqqp_large (2048, 256) | no in 2000 iters | 2000 | 49649 |
+
+Larger problems need adaptive rho or per-shape rho tuning.
+
+### ALM 10-proposal smoke on eqqp_small (Mac, OpenAI gpt-5.5 medium)
+
+| | wall_ms (3-rep median +/- std) | iters | gap |
+|---|---:|---:|---:|
+| seed `alm_step_v0` | 85.2 +/- 12.3 | 70 | 8.70e-07 |
+| gen-1 (kept) | 56.2 +/- 17.6 | 20 | 7.35e-07 |
+| **gen-2 (kept, champion)** | **54.1 +/- 20.6** | 20 | 9.56e-07 |
+
+Speedup 1.58x. Model rationale: with fixed rho the ALM iteration is affine,
+so precompute the transition matrix `M` and offset in `init_state` and do
+one matvec per `alm_step` instead of trisolve+matvec. Iter count drops from
+70 to 20 because the model also figured out a power-iteration-style
+collapse of multiple algorithm steps per public step (analog of PDHG temporal
+fusion, but bounded by global dependency cone of the linear solve).
+
+Proposals 3-10 attempted to game (move iters into init_state) and were
+correctly rejected by the timing-contract fix.
+
+## P-pivot.4 — Basis pursuit specimen + cross-problem strategy adaptation — 2026-05-10
+
+`frontend/basis_pursuit.py` + `kernels/mlx/lib.py::BasisPursuitMLX` +
+`kernels/mlx/seeds/pdhg_bp_step_v0.py`. Same algorithm (PDHG) as TV but K is
+dense A. Tests (`tests/test_basis_pursuit.py`): 4/4 pass on Linux against
+CVXPY-CLARABEL, including sparse-signal recovery under RIP.
+
+### BP-MLX baseline (Mac, fp32, gap < 1e-6, 3-rep median)
+
+| shape (m, n) | conv | iters | wall_ms |
+|---|---|---:|---:|
+| bp_small (64, 256) | yes | 440 | 42.3 |
+| bp_medium (256, 1024) | yes | 600 | 53.8 |
+
+### BP 5-proposal smoke on bp_small (Mac, OpenAI gpt-5.5 medium)
+
+| | wall_ms (3-rep median +/- std) | iters | gap |
+|---|---:|---:|---:|
+| seed `pdhg_bp_step_v0` | 162.6 +/- 14.5 | 440 | 8.65e-07 |
+| gen-2 (kept) | 148.4 +/- 15.7 | 440 | 8.65e-07 |
+| **gen-3 (kept, champion)** | **143.5 +/- 10.8** | 450 | 6.71e-07 |
+
+Speedup 1.13x. Model rationale (excerpted):
+- gen-2: "hoists all loop-invariant MLX objects out of `pdhg_step`: the tail
+  scalar buffer `[tau, theta]` is allocated once in `init_state` instead of
+  once per iteration, `-sigma*b` is precomputed once..."
+- gen-3: "moves more loop-invariant work into `init_state`: materializes
+  contiguous dense matrix handles and fp32 pre-scaled copies `sigma*A` and
+  `tau*A.T`..."
+- gen-4 (discarded): tried explicit Metal GEMV kernels — couldn't beat
+  `mx.matmul`.
+
+**Cross-problem strategy adaptation observed.** With the SAME `program.md`
+that drove the PDHG-TV run to 99x via temporal fusion, the BP run did NOT
+attempt temporal fusion. Reason: dense A means each output of K^T y depends
+on every entry of y, so any k-step fusion would carry the full halo (no
+savings). The model recognized this and pivoted to allocator/precompute
+optimizations specific to the matvec-bound regime.
+
+This is the cross-algorithm/cross-problem behavior the original plan
+called for: the same harness produces different optimization strategies
+when the problem structure changes. No transfer-seeds machinery needed —
+the model adapts based on slot+source context alone.
+
+## P-pivot.5 — ADMM specimen for LASSO via x=z splitting — 2026-05-10
+
+`algorithms/admm.py` (Boyd 2011 §3.1 + §3.4.1 adaptive rho) +
+`frontend/lasso_admm.py` + `kernels/numpy_admm_ref.py` +
+`kernels/mlx/lib.py::LassoAdmmMLX` (Cholesky on (A^T A + rho I) via
+`stream=mx.cpu`) + `kernels/mlx/seeds/admm_lasso_step_v0.py`. Tests
+(`tests/test_admm.py`): 6/6 pass on Linux including CVXPY-CLARABEL match
+(3 random seeds).
+
+The ALM and ADMM drivers were extended to accept `rho=None` (defer to the
+seed's default, which the seed reads from `problem.default_rho`, the Boyd
+lambda_max heuristic). Without this fix the loop hardcoded rho=1.0, which
+made ADMM-LASSO converge in 650 iters instead of 60.
+
+### ADMM-MLX baseline through the synth loop (Mac, fp32, primal_res < 1e-5)
+
+| shape (m, n) | iters | wall_ms (3-rep median) |
+|---|---:|---:|
+| tall_small (2000, 500) | 60 | 123.9 +/- 14.2 |
+
+### ADMM 5-proposal smoke on tall_small (Mac, OpenAI gpt-5.5 medium)
+
+| | wall_ms | iters | primal_res |
+|---|---:|---:|---:|
+| seed `admm_lasso_step_v0` | 123.9 +/- 14.2 | 60 | 1.58e-06 |
+| **proposal 1 (kept, champion)** | **93.4 +/- 15.1** | 60 | 1.86e-06 |
+
+**Speedup 1.33x.** Model rationale (excerpted):
+> "in init_state it builds the usual factor, then attempts to materialize
+> the fp32 inverse action by solving the factor against an identity matrix
+> once; each iteration then uses a single dense matrix-vector multiply
+> H^{-1} @ rhs instead of two triangular solves."
+
+The model recognized the same fixed-parameter algebra trick as ALM: with
+fixed rho, amortize one full inverse materialization across all iterations,
+replacing two trisolves per iter (CPU-only on MLX) with one matvec
+(GPU-friendly). Proposals 2-5 tried Metal fast paths and compiled helpers;
+none beat the simple inverse-matvec approach.
+
+## Final bench (post-pivot, 2026-05-10)
+
+All numbers Mac M3 Pro fp32 MLX, 3-5 rep medians under fitness gate (KKT for
+FISTA, primal-dual gap for PDHG, primal residual for ALM/ADMM). **Corrected
+eval timing** (kernel_init counted in wall_time_s; `cost_model="single"`
+gates on `setup + solve`).
+
+| slot | shape | seed wall_ms | autoresearch champion | speedup | rationale class |
+|---|---|---:|---:|---:|---|
+| lasso/fista (Gram) | tall_medium | 21.6 (5-rep median) | n/a (seed = champion, 1-rep recorded was 16.4) | 1.0x | hand-coded Gram precompute |
+| total_variation_1d/pdhg | tv1d_medium | 486.93 +/- 8.45 | 4.92 +/- 0.20 (256-step temporal fusion + halo) | **99x** | rediscovered time-skewing |
+| equality_qp/alm | eqqp_small | 85.2 +/- 12.3 | 54.1 +/- 20.6 (fixed-rho affine transition) | 1.58x | algebra recognition (linear iter) |
+| basis_pursuit/pdhg | bp_small | 162.6 +/- 14.5 | 143.5 +/- 10.8 (precompute scaled matrices) | 1.13x | matvec-bound allocator hoisting |
+| lasso_admm/admm | tall_small | 123.9 +/- 14.2 | 93.4 +/- 15.1 (materialize H^{-1} once, matvec replaces trisolve) | 1.33x | trisolve to matvec via inverse |
+
+(P-pivot.5 — ADMM specimen, full writeup in the section before this table.)
+
+For comparison vs CPU references (numpy fp64, single rep):
+
+| | numpy fp64 ms |
+|---|---:|
+| FISTA-LASSO tall_medium | ~146 (from old bench) |
+| PDHG-TV tv1d_medium | 146 |
+| ALM eqqp_small | similar to MLX seed (no GPU lever for n=64) |
+| BP bp_small | similar to MLX seed |
+
+Speedup of MLX autoresearch champion vs CPU numpy reference, where measured:
+- PDHG-TV-1D tv1d_medium: **30x** (4.92 ms vs 146 ms)
+
+### Verdict
+
+The harness produces materially different speedups depending on the
+algorithm-problem pair's per-iter surface area:
+
+- **High yield (PDHG-TV)**: small local stencil + many simple ops →
+  rediscovered time-skewing → 99x.
+- **Medium yield (ALM-eqqp)**: linear-update structure can be precomputed
+  → 1.58x.
+- **Low yield (PDHG-BP)**: dense matvec-bound, mx.matmul already strong →
+  1.13x via allocator/precompute hoisting.
+
+This pattern matches what the autoresearch literature reports (AlgoTune,
+EvoEngineer): LLMs re-combine known techniques effectively when the search
+surface admits them. The pivot's premise (right specimen unlocks real
+autoresearch) is validated; the magnitude of the win is bounded by the
+problem's intrinsic structure, not the search engine.
+

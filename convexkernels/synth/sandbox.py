@@ -78,6 +78,7 @@ def write_eval_config(
     warmup_runs: int = 0,
     max_iters: int = 200,
     tol: float = 1e-6,
+    algorithm: str = "fista",
 ) -> Path:
     """Pickle the problem and write the eval config to `run_dir`."""
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -96,6 +97,7 @@ def write_eval_config(
         "warmup_runs": warmup_runs,
         "max_iters": max_iters,
         "tol": tol,
+        "algorithm": algorithm,
         "problem_pickle_path": str(problem_path),
     }
     config_path = run_dir / "eval_config.json"
