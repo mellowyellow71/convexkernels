@@ -100,6 +100,54 @@ The most valuable mutations for this specimen are:
 - **Don't pickle MLX arrays into the candidate source**. Build them in
   `init_state` or `prepare_problem`.
 
+### No algorithm replacement
+
+The autoresearch loop's job is to **make the specified algorithm faster**,
+not to replace it with a different solver. The active algorithm for this
+slot is named in section 1 ("Active target") and the math is named in
+section 2 ("Algorithm semantics"). The model is expected to optimize the
+implementation of that algorithm — fuse ops, change layout, exploit
+structure — not to swap in a closed-form or specialized solver and wrap it
+in a fake `pdhg_step` for contract compliance.
+
+Forbidden patterns (a non-exhaustive list):
+
+- **Closed-form / direct solvers in `init_state`** that compute the optimum
+  before the loop starts, leaving `pdhg_step` to do trivial verification
+  iterations. Examples: Condat 2013 1D-TV solver for TV-L2 denoising;
+  taut-string for isotonic regression; explicit projection onto Ax=b.
+  Even if the public interface is preserved and KKT/gap passes, this is
+  algorithm replacement.
+- **Pre-solving with a different optimization method** (e.g. running L-BFGS
+  to convergence inside `init_state` and then doing 10 dummy PDHG steps).
+- **Materializing an exact solution from problem-specific algebra** (e.g.
+  for LASSO with orthonormal A, x* = soft(A^T b, lam) is a one-liner; this
+  is not an "ADMM optimization", it's bypassing ADMM entirely).
+- **Hardcoded answers for the test instances**.
+
+Distinguish from **allowed amortizations**:
+
+- **Precomputing the same algorithm's loop-invariants**: A^T A and A^T b
+  for FISTA-Gram, Cholesky factor of (P + rho A^T A) for ALM, the Gram
+  matrix inverse for ADMM with fixed rho. These reduce per-iter cost
+  while preserving the algorithm's iterate trajectory.
+- **Temporal fusion / time-skewing**: collapse k iterations of the
+  specified algorithm into one launch via stencil dependency analysis.
+  Each fused step still computes what k separate step calls would have
+  computed; only the launch count changes.
+- **Algebraic restatement of the same iterate**: e.g. recognizing the
+  ALM/ADMM update is affine for fixed rho and storing the transition
+  matrix instead of redoing the trisolve each iter. The iterate sequence
+  is identical to the original algorithm.
+- **Algorithm variants with documented convergence proofs**: e.g.
+  Chambolle-Pock Algorithm 2 (accelerated), gradient-restart FISTA. These
+  are explicitly named in section 2 as allowed variants.
+
+The litmus test: if you replaced the public `pdhg_step` body with `pass`
+(no-op) and your solution still passed because the work was all in
+`init_state`, you have replaced the algorithm. Reject your own proposal
+and try again.
+
 ## Logging
 
 Every proposal lands as a row in:
