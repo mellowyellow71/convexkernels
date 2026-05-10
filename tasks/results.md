@@ -2256,7 +2256,77 @@ trisolve isn't dominant, so there's little lever past the previous
 Crash rate ~3% — most failures from generated code with import or
 syntax errors. The timing-contract fix held; no gaming attempts succeeded.
 
-### Karpathy-style dashboard
+## Parallel-chains side-by-side experiment — 2026-05-10 13:14-16:09
+
+The overnight session's run on PDHG-TV-medium took a different path
+(Condat warm-start, 48 ms) than the 30-prop kill-test (256-step temporal
+fusion, 4.92 ms via the re-eval script). To test whether the 10x
+divergence was inherent path-dependence or measurement methodology, we
+ran **4 independent chains of 30 proposals each on the same target**
+with the **tightened program.md** (algorithm-replacement rule added) and
+the same loop / proposer settings. State roots:
+`synth_run_parallel_total_variation_1d_pdhg_apple_silicon_fp32_tv1d_medium_20260510_1314_chain_{0..3}`.
+Runtime ~2:55; 120 proposals total via `scripts/parallel_chains.sh`.
+
+| chain | gen | wall_ms (3-rep med +/- std) | iters | fitness | what the model found |
+|---:|---:|---:|---:|---:|---|
+| 0 | 26 | 60.84 +/- 5.60 | 10 | 7.79e-07 | 512 PDHG iters per `pdhg_step`, single-threadgroup full-domain Metal kernel with threadgroup memory |
+| 1 | 20 | 70.52 +/- 2.88 | 60 | 8.45e-07 | 48-substep temporal fusion x 128-vertex spatial tiles |
+| **2** | 14 | **54.02 +/- 13.92** | 10 | 7.79e-07 | **non-zero warm-start: x0 = x_bar0 = b, y0 = 0** (data-term minimizer); CP converges from any feasible point so this is contract-compliant |
+| 3 | 14 | 63.99 +/- 12.14 | 10 | 9.90e-07 | 270 Algorithm-2 (accelerated) PDHG iters per public step |
+
+Cross-chain best: chain 2 at **54.02 ms**. Cross-chain spread: 54-71 ms
+= **1.31x variance**. This is much tighter than the 4.92 vs 48 ms
+divergence between the kill-test re-eval and the overnight Condat run.
+
+### Reading the results
+
+**The tightened program.md held**: all four chains stayed inside the
+algorithm contract. The Condat / closed-form replacement pattern that
+showed up in the overnight run is absent. Chain 2's warm-start at x0=b
+is contract-compliant — it changes the initial point, not the
+algorithm; CP convergence holds for any feasible start.
+
+**All four chains independently found temporal fusion as the primary
+lever.** Specifics varied (single full-domain block of 512 / spatial
+tile of 48x128 / Algorithm-2 macro-batch of 270 / single full-domain
+warm-start of 512+x0=b) but the kernel-level technique was the same
+across chains. Chain 2 layered an additional algorithm-level trick
+(warm-start) on top of the fusion.
+
+**Path dependence is bounded, not unbounded.** Under the corrected eval
++ tightened program.md, four runs find similar wins within ~30%, not
+10x divergence. The earlier 4.92 ms kill-test result is below this
+range, but that number came from a different measurement path
+(`scripts/reeval_killtest.py` runs all 5 reps in one subprocess; the
+loop runs each rep as a separate subprocess and per-rep subprocess
+overhead inflates the measured wall_ms). Apples-to-apples within one
+measurement methodology, the cross-chain spread is the right picture.
+
+**Implication for the harness**: single-chain runs are now safe enough
+that parallel exploration is a 1.3x bonus, not a 10x necessity. The
+real lever remaining is between methodology variants of timing
+(per-rep subprocess vs single-subprocess) and possibly the
+`single_solve_time = setup + solve` accounting under `cost_model="single"`.
+
+### Multi-chain dashboard
+
+`scripts/parallel_chains.sh` runs the experiment and at the end
+auto-renders a comparison dashboard:
+`parallel_logs/synth_run_parallel_*_dashboard.html`.
+
+The dashboard's comparison card overlays all four chains' champion
+progression curves on one log-scale chart, with discarded proposals
+faded gray, kept proposals as colored stars, and the global best
+circled in black. Cross-chain spread (variance ratio) is shown in the
+card header.
+
+## Tools delivered for monitoring
+
+`scripts/lineage_summary.py` is a CLI analyzer for one or more
+`lineage.jsonl` files — emits totals, accepted-champion trajectory
+(gen / iters / fitness / solve_ms / id), discard-reason histogram, and
+best-champion details.
 
 `scripts/lineage_dashboard.py` renders one or more `lineage.jsonl` files
 into a self-contained HTML page with:
