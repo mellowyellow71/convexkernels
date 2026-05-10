@@ -2180,3 +2180,105 @@ surface admits them. The pivot's premise (right specimen unlocks real
 autoresearch) is validated; the magnitude of the win is bounded by the
 problem's intrinsic structure, not the search engine.
 
+## Overnight multi-slot session — 2026-05-10 04:57 - 09:42
+
+160-proposal session across three slots in sequence on a single Mac M3
+Pro, run via `scripts/overnight_multi_slot.sh`. State roots:
+`synth_run_overnight_{pdhg_tv,admm,bp}_20260510_0457`. Lineage extracted
+to `overnight_lineage/` and analyzed via `scripts/lineage_summary.py`.
+
+| slot | shape | n_props | kept | first kept ms | best ms | speedup over first kept |
+|---|---|---:|---:|---:|---:|---:|
+| total_variation_1d/pdhg | tv1d_medium | 80 | 13 | 442.78 | 48.07 | 9.21x |
+| basis_pursuit/pdhg | bp_medium | 50 | 5 | 189.21 | 104.71 | 1.81x |
+| lasso_admm/admm | tall_small | 30 | 2 | 111.18 | 105.04 | 1.06x |
+
+### PDHG-TV: divergent path from the kill-test
+
+The 30-proposal kill-test had found a 256-step temporal fusion at gen 10
+(4.92 ms corrected eval). The 80-proposal overnight on the same target
+took a **completely different path** and ended at 48 ms — 10x slower than
+the kill-test champion.
+
+What the overnight found instead: at gen 26 the model wrote an exact O(n)
+Condat 1D TV-L2 direct solver (Condat 2013) into `init_state`, computing
+the optimum in fp64 on the host and converting to fp32 MLX arrays. The
+public `pdhg_step` then runs from the optimal start; iters=10 reflects
+trivial convergence-verification steps. Subsequent kept proposals (gens
+27, 28, 30, 51) trimmed the Condat setup overhead.
+
+This is technically contract-conforming (KKT < 1e-6, timing-contract fix
+correctly bills the Condat work in wall_time) but spiritually
+*algorithm replacement* rather than *algorithm optimization*. The
+`program.md` says "math must remain Chambolle-Pock 2011 PDHG (or a
+documented variant)" — Condat's algorithm is a different solver. Two
+legitimate readings:
+
+- **Strict**: contract violation; the autoresearch loop should reject
+  warm-starts from non-PDHG solvers. Tighten program.md.
+- **Loose**: the user wants the fastest KKT-valid solver for TV-L2;
+  Condat is a known O(n) solution and the model correctly chose it.
+  The PDHG iteration still runs (just trivially).
+
+Either way: **the original kill-test's 256-step temporal fusion (4.92 ms)
+is a much faster solution than the overnight's Condat path (48 ms)**.
+This means the autoresearch loop's outcome is path-dependent: with the
+same target and timing-contract fix, two runs found two different lever
+points and one was 10x better than the other. Implication for future
+sessions: encourage exploration via temperature / multiple parallel
+seeds, not just sequential iteration from the current champion.
+
+### BP-medium: 1.81x via tile-level fast paths
+
+50 proposals from a fresh seed on bp_medium. Trajectory: 189 → 105 ms.
+Best champion (gen 49, id `dc92569a`) lowered iters from 620 to 70 by
+detecting convergence earlier (the gap formula stabilizes once the L1
+support has settled, even though full feasibility hasn't).
+
+### ADMM-LASSO: nearly flat overnight
+
+Only 2 of 30 proposals kept; the better was 1.06x over the first accept.
+The tall_small problem (n=500) is small enough that the per-iter
+trisolve isn't dominant, so there's little lever past the previous
+1.33x H^{-1}-materialization win from the smoke. A medium-shape ADMM run
+(tall_medium, n=2000 with the inverse approach) might find more.
+
+### Discard breakdown across all 160 proposals
+
+| reason | count |
+|---|---:|
+| discard:not_faster_than_baseline | 132 |
+| keep:passed | 20 |
+| crash:runtime_error | 5 |
+| discard:not_converged | 2 |
+| crash:no_result | 2 (subprocess returncode -6, likely OOM) |
+
+Crash rate ~3% — most failures from generated code with import or
+syntax errors. The timing-contract fix held; no gaming attempts succeeded.
+
+### Karpathy-style dashboard
+
+`scripts/lineage_dashboard.py` renders one or more `lineage.jsonl` files
+into a self-contained HTML page with:
+
+- per-slot summary card (total / kept / discarded / crashed, best champion)
+- SVG plot of solve_ms vs proposal index, kept points highlighted as blue
+  stars connected by the champion progression line, discarded points
+  faded gray, crashes marked with red x at the top
+- collapsible champion lineage chain with rationales
+- collapsible discard-reason histogram
+- optional `--refresh SEC` meta tag for live tail viewing
+
+```bash
+python scripts/lineage_dashboard.py \
+  synth_run_overnight_pdhg_tv_*/ \
+  synth_run_overnight_admm_*/ \
+  synth_run_overnight_bp_*/ \
+  --out /tmp/dashboard.html --refresh 30
+```
+
+Open the HTML in a browser; with `--refresh 30` it auto-fetches every 30
+seconds. Combined with a `watch -n 30 python scripts/lineage_dashboard.py
+...` loop on the host running the autoresearch, the dashboard updates
+live as new proposals land.
+
