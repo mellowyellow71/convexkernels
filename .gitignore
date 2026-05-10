@@ -1,0 +1,26 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.venv/
+venv/
+.env
+*.swp
+*.swo
+*~
+build/
+dist/
+.DS_Store
+.ipynb_checkpoints/
+
+# Local agent/editor state
+.agents/
+.claude/
+.codex/
+
+# Synthesis runtime state (kept locally, not in git)
+synth_state/
+runs/
+
+# Local data caches
+data/

@@ -1,0 +1,43 @@
+mlx version: 0.31.2
+default device: Device(gpu, 0)
+
+=== Probe 1: mx.fast.metal_kernel smoke test ===
+out[42] = 1764.0 (expect 1764.0)
+out[1000] = 1000000.0 (expect 1000000.0)
+
+=== Probe 2: mlx.core.linalg surface inventory ===
+dir: ['cholesky', 'cholesky_inv', 'cross', 'eig', 'eigh', 'eigvals', 'eigvalsh', 'inv', 'lu', 'lu_factor', 'norm', 'pinv', 'qr', 'solve', 'solve_triangular', 'svd', 'tri_inv']
+  cholesky: present
+  solve_triangular: present
+  solve: present
+  lu: present
+  qr: present
+  svd: present
+  norm: present
+  inv: present
+  tri: MISSING
+  cross: present
+
+=== Probe 3: mx.matmul baseline timing on bench shapes (fp32) ===
+(m,n)             ms/iter       GB/s
+(2000,500)          0.291       27.5
+(5000,2000)         0.892       89.7
+(500,2000)          0.245       32.7
+(2000,10000)        1.418      112.8
+
+=== Probe 4: precision axis dry run ===
+
+  dtype = mlx.core.float32
+  (m,n)             ms/iter       GB/s
+  (2000,500)          0.180       44.4
+  (5000,2000)         0.748      106.9
+
+  dtype = mlx.core.float16
+  (m,n)             ms/iter       GB/s
+  (2000,500)          0.170       23.5
+  (5000,2000)         0.405       98.7
+
+  dtype = mlx.core.bfloat16
+  (m,n)             ms/iter       GB/s
+  (2000,500)          0.168       23.9
+  (5000,2000)         0.376      106.3
