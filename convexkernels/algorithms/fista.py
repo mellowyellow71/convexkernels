@@ -49,6 +49,7 @@ def fista(
     kernel_step: Callable[[FistaState, Problem, float], FistaState] = _numpy_fista_step,
     kernel_init: Callable[[Problem], FistaState] = _default_numpy_init,
     record_history: bool = True,
+    convergence_check_every: int = 1,
     callback: Optional[Callable[[int, FistaState, float], None]] = None,
 ) -> FistaResult:
     """Run FISTA on `problem` until KKT < tol or max_iters.
@@ -61,14 +62,20 @@ def fista(
     `kernel_step` is the per-iter compute; `kernel_init` builds the initial
     state. Both default to the numpy reference. MLX kernels override both.
     """
+    # Time `kernel_init` as part of `wall_time_s` so a candidate cannot game
+    # the eval by stuffing per-step compute into init_state. Without this an
+    # accepted variant can move N solver iterations into init_state, report
+    # iters=k where k << N, and pass the speedup gate while doing more total
+    # work than the seed. The Sakana CUDA Engineer benchmark-cheating mode.
+    t0 = perf_counter()
     state = kernel_init(problem)
     t = 1.0 / problem.L
 
     history: dict = {"kkt": [], "wall_time": []} if record_history else {}
-    t0 = perf_counter()
     kkt = float("inf")
     converged = False
     k = -1
+    check_every = max(1, int(convergence_check_every))
 
     for k in range(max_iters):
         state_new = kernel_step(state, problem, t)
@@ -80,16 +87,20 @@ def fista(
             state_new = type(state_new)(x=state_new.x, y=state_new.x, theta=1.0)
 
         state = state_new
-        kkt = problem.kkt_residual(state.x)
 
-        if record_history:
-            history["kkt"].append(kkt)
-            history["wall_time"].append(perf_counter() - t0)
-        if callback is not None:
-            callback(k, state, kkt)
-        if kkt < tol:
-            converged = True
-            break
+        # Convergence check + trajectory recording every `check_every` iters.
+        # On MLX, kkt_residual forces full GPU sync; checking every iter is
+        # the dominant cost on small problems.
+        if (k + 1) % check_every == 0 or k == max_iters - 1:
+            kkt = problem.kkt_residual(state.x)
+            if record_history:
+                history["kkt"].append(kkt)
+                history["wall_time"].append(perf_counter() - t0)
+            if callback is not None:
+                callback(k, state, kkt)
+            if kkt < tol:
+                converged = True
+                break
 
     # Convert mlx array to numpy at the boundary for FistaResult.x.
     final_x = state.x if isinstance(state.x, np.ndarray) else np.asarray(state.x)

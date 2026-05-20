@@ -12,6 +12,7 @@ import numpy as np
 
 from ..frontend.lasso import Lasso
 from ..frontend.nonnegative_lasso import NonnegativeLasso
+from ..frontend.total_variation import TVDenoising1D, TVDenoising2D
 
 
 @dataclass(frozen=True)
@@ -60,3 +61,38 @@ def make_synthetic_nonnegative_lasso(
     b = A @ x_true + spec.noise * rng.standard_normal(spec.m)
     lam_max = float(max(np.max(A.T @ b), 0.0))
     return NonnegativeLasso(A, b, lam=spec.lam_frac * lam_max)
+
+
+@dataclass(frozen=True)
+class TvShapeSpec:
+    """Total-variation problem shape: piecewise-constant truth + Gaussian noise."""
+    name: str
+    n: int
+    n_pieces: int = 8
+    noise: float = 0.1
+    lam: float = 0.5
+
+
+DEFAULT_TV1D_SHAPES: tuple[TvShapeSpec, ...] = (
+    TvShapeSpec("tv1d_small",  n=256,  n_pieces=4, noise=0.1, lam=0.5),
+    TvShapeSpec("tv1d_medium", n=2048, n_pieces=16, noise=0.1, lam=0.5),
+    TvShapeSpec("tv1d_large",  n=16384, n_pieces=64, noise=0.1, lam=0.5),
+)
+
+
+def make_synthetic_tv_1d(spec: TvShapeSpec, seed: int = 0) -> TVDenoising1D:
+    """Generate a piecewise-constant truth + Gaussian noise 1D TV problem.
+
+    The autoresearch loop uses this as a fixed-shape evaluator for PDHG seeds.
+    Number of pieces and noise level set the difficulty; lam set near 0.5 for
+    a recognizable-but-non-trivial recovery target.
+    """
+    rng = np.random.default_rng(seed)
+    breakpoints = np.sort(rng.choice(spec.n, size=spec.n_pieces - 1, replace=False))
+    levels = rng.standard_normal(spec.n_pieces)
+    truth = np.zeros(spec.n)
+    edges = np.concatenate([[0], breakpoints, [spec.n]])
+    for i in range(spec.n_pieces):
+        truth[edges[i]:edges[i + 1]] = levels[i]
+    b = truth + spec.noise * rng.standard_normal(spec.n)
+    return TVDenoising1D(b, lam=spec.lam)
