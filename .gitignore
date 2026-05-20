@@ -24,3 +24,14 @@ runs/
 
 # Local data caches
 data/
+
+# Path-pivot bench caches (Adelie reference solutions, MB-scale .npz files
+# regenerated on the Mac via scripts/run_adelie_baseline.py)
+convexkernels/bench/cache/
+
+# Locally rsynced lineage caches (pulled from the Mac for analysis)
+overnight_lineage/
+parallel_lineage/
+
+# One-off bench / re-eval outputs from scripts/
+baseline_pdhg_tv.json
