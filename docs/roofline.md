@@ -109,3 +109,84 @@ roofline_pct_med = roofline_floor_ms_per_iter / measured_ms_per_iter * 100
 
 A variant at >80% is near the wall; further mutation is unlikely to help.
 A variant at <40% has headroom; the proposer should iterate.
+
+---
+
+# Gram-path cost model
+
+The section above models the **direct** gradient `g = A^T(Ay - b)`, which reads
+the `(m, n)` matrix `A` **twice** per iteration. The current `tall_medium`
+champion does not use that path: it precomputes `G = A^T A` (`(n, n)`) and
+`c = A^T b` once, then each iteration is a single dense matvec `g = G y - c`.
+The direct roofline therefore *mis-describes the champion*. `synth/roofline.py`
+exposes a Gram model (`gram_fista_*`, `estimate_gram_fista_roofline`) and a
+strategy dispatcher (`estimate_fista_roofline(..., gradient_strategy=...)`);
+`EvalConfig.gradient_strategy` selects it so Tier-3 reports Gram-path numbers
+for Gram champions.
+
+## Per-iter cost (Gram, dense, fp32)
+
+The hot path is one matvec over `G`:
+
+$$
+\text{FLOPs} \approx 2n^2, \qquad
+\text{bytes}_\text{fp32} \approx 4n^2 + 32n
+$$
+
+$$
+\text{AI}_\text{fp32} = \frac{2n^2}{4n^2} = 0.5 \text{ ops/byte}
+$$
+
+Still bandwidth-bound — but the *quantity* of traffic is what changes. For
+`tall_medium` `(m, n) = (5000, 2000)`:
+
+| path | matrix read / iter | bytes / iter | floor @150 GB/s |
+|---|---|---:|---:|
+| direct | `A` twice = `2mn` | 80 MB | 0.533 ms |
+| Gram (dense) | `G` once = `n²` | 16 MB | 0.107 ms |
+| Gram (symmetric) | lower-tri `G` = `n²/2` | 8 MB | 0.053 ms |
+
+So for tall problems (`m ≫ n`) Gram moves **~5× fewer bytes per iteration** than
+direct — the analytical reason the measured Gram solve (20.6 ms) beats direct
+(53.6 ms) on this shape. The model predicts the regime, not the exact constant
+(measured ratio 2.6× vs modeled 5× — MLX GEMV efficiency and launch overhead
+eat the rest, which is itself the next thing to attack).
+
+## Kernel levers the Gram model exposes
+
+- **Symmetric matvec (`symv`).** `G = A^T A` is symmetric PSD, so a triangular
+  kernel reads only the lower triangle and roughly halves per-iter bandwidth.
+  Because the Gram solve is bandwidth-bound, this is close to a 2× lever on the
+  solve. `gram_fista_bytes_per_iter(..., symmetric=True)` models it; MLX has no
+  `symv`, so this is a candidate custom Metal kernel.
+- **Amortize the KKT check.** FISTA here evaluates `kkt_residual` every
+  iteration, which for the Gram path is a *second* `n²` matvec — it doubles
+  per-iter traffic. Checking KKT every `k` iterations (k = 4–8) nearly halves
+  Gram per-iter bytes with no effect on the optimum. Pure data-transfer /
+  fewer-matvec win.
+- **Gram storage precision.** `G` in bf16/fp16 halves bytes again, but
+  `mixed_gram` currently fails the KKT contract (`G = A^TA` squares the
+  condition number). The lever is real but needs error-feedback / fp32
+  accumulation, not naive fp16 storage.
+
+## Setup-amortization crossover
+
+Gram is not free: forming `G = A^T A` costs `2mn²` FLOPs once
+(`gram_setup_flops`). With `A` fixed across repeated solves, Gram pays setup
+once and saves `Δ = direct_solve − gram_solve` per solve, so it wins after
+
+$$
+N^* = \frac{\text{setup}}{\text{direct\_solve} - \text{gram\_solve}}
+$$
+
+solves (`amortization_crossover`). For `tall_medium`
+(setup ≈ 3414 ms, direct solve ≈ 53.6 ms, Gram solve ≈ 20.6 ms):
+
+$$
+N^* = \frac{3414}{53.6 - 20.6} \approx 103 \text{ solves}.
+$$
+
+This is exactly the `single` vs `amortized` cost-model split: the `single` gate
+charges setup, so Gram loses below ~100 solves; the `amortized` gate excludes
+setup, so Gram wins immediately. If Gram's per-solve time is not faster, setup
+can never be amortized and the crossover is `inf`.

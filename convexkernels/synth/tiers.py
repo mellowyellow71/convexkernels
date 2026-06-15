@@ -16,7 +16,7 @@ from typing import Any, Iterable
 
 from ..bench.shapes import ShapeSpec, make_synthetic_lasso
 from .lineage import Tier1Result, Tier2Result, Tier3PerShape, Tier3Result
-from .roofline import DEFAULT_APPLE_SILICON_PEAK_GB_S, estimate_dense_fista_roofline
+from .roofline import DEFAULT_APPLE_SILICON_PEAK_GB_S, estimate_fista_roofline
 from .sandbox import SandboxResult, run_kernel, write_eval_config
 
 
@@ -27,6 +27,8 @@ class EvalConfig:
     problem_backend: str = "native"
     problem_dtype: str = "fp32"
     dtype_strategy: str = "fp32"
+    gradient_strategy: str = "direct"
+    gram_symmetric: bool = False
     cost_model: str = "single"
     warmup_runs: int = 1
     timeout_s: float = 60.0
@@ -187,12 +189,14 @@ def run_tier3(
         if times:
             wall_time_med_ms = float(statistics.median(times))
             n_iters_med = int(statistics.median(iters))
-            roofline = estimate_dense_fista_roofline(
+            roofline = estimate_fista_roofline(
                 m=spec.m,
                 n=spec.n,
                 dtype_name=config.problem_dtype,
                 wall_time_ms=wall_time_med_ms,
                 n_iters=n_iters_med,
+                gradient_strategy=config.gradient_strategy,
+                symmetric=config.gram_symmetric,
                 peak_bandwidth_gb_s=config.peak_bandwidth_gb_s,
             )
             per_shape.append(
@@ -218,12 +222,14 @@ def run_tier3(
                 )
             )
         else:
-            roofline = estimate_dense_fista_roofline(
+            roofline = estimate_fista_roofline(
                 m=spec.m,
                 n=spec.n,
                 dtype_name=config.problem_dtype,
                 wall_time_ms=float("inf"),
                 n_iters=0,
+                gradient_strategy=config.gradient_strategy,
+                symmetric=config.gram_symmetric,
                 peak_bandwidth_gb_s=config.peak_bandwidth_gb_s,
             )
             per_shape.append(

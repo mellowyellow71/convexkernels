@@ -166,6 +166,31 @@ def _record_matches_slot(record: dict, slot: Slot) -> bool:
     )
 
 
+def _gradient_strategy_for_path(
+    source_path: Path | None, kernel_module_spec: str
+) -> str:
+    """Detect the gradient strategy of a kernel given its source file path."""
+    source = ""
+    if source_path is not None and Path(source_path).exists():
+        source = Path(source_path).read_text(errors="replace")
+    return _detect_gradient_strategy(source, kernel_module_spec)
+
+
+def _detect_gradient_strategy(source: str, kernel_module_spec: str) -> str:
+    """Classify a kernel source/module as the Gram or direct gradient path.
+
+    Used both for the proposer's runtime focus and to label the roofline cost
+    model so Tier-3 reports Gram-path bandwidth/AI for Gram champions. This only
+    selects a reporting/metadata strategy; it never changes the compute path.
+    """
+    is_gram = (
+        "LassoGramMLX" in source
+        or 'GRADIENT_STRATEGY = "gram"' in source
+        or "gram_fista" in kernel_module_spec
+    )
+    return "gram" if is_gram else "direct"
+
+
 def _kernel_source_summary(
     source_path: Path | None,
     kernel_module_spec: str,
@@ -176,11 +201,7 @@ def _kernel_source_summary(
     source = ""
     if source_path is not None and source_path.exists():
         source = source_path.read_text(errors="replace")
-    is_gram = (
-        "LassoGramMLX" in source
-        or 'GRADIENT_STRATEGY = "gram"' in source
-        or "gram_fista" in kernel_module_spec
-    )
+    is_gram = _detect_gradient_strategy(source, kernel_module_spec) == "gram"
     if is_gram:
         focus = (
             "Current champion uses Gram-precomputed gradients. Tail-kernel "
@@ -406,12 +427,16 @@ def run_synth_loop(
     generation = 1
     baseline_wall_ms: float | None = None
     tier2_baseline_wall_ms: float | None = None
+    current_gradient_strategy = _gradient_strategy_for_path(
+        current_source_path, current_kernel_module_spec
+    )
     eval_config = EvalConfig(
         seed_kernel=seed_kernel,
         variant=algorithm_variant,
         problem_backend=problem_backend,
         problem_dtype=current_problem_dtype,
         dtype_strategy=current_dtype_strategy,
+        gradient_strategy=current_gradient_strategy,
         cost_model=cost_model,
         warmup_runs=warmup_runs,
         timeout_s=timeout_s,
@@ -642,6 +667,9 @@ def run_synth_loop(
                         problem_backend=problem_backend,
                         problem_dtype=next_problem_dtype,
                         dtype_strategy=next_dtype_strategy,
+                        gradient_strategy=_gradient_strategy_for_path(
+                            Path(source_info.path), kernel_module_spec
+                        ),
                         cost_model=cost_model,
                         warmup_runs=warmup_runs,
                         timeout_s=timeout_s,
@@ -670,6 +698,9 @@ def run_synth_loop(
                     problem_backend=problem_backend,
                     problem_dtype=next_problem_dtype,
                     dtype_strategy=next_dtype_strategy,
+                    gradient_strategy=_gradient_strategy_for_path(
+                        Path(source_info.path), kernel_module_spec
+                    ),
                     cost_model=cost_model,
                     warmup_runs=warmup_runs,
                     timeout_s=timeout_s,
