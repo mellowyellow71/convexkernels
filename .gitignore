@@ -35,3 +35,6 @@ parallel_lineage/
 
 # One-off bench / re-eval outputs from scripts/
 baseline_pdhg_tv.json
+
+# Autoresearch run state roots (multi-GB local artifacts)
+synth_run*/

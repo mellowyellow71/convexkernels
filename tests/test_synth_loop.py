@@ -1,9 +1,10 @@
-"""Tests for the new (post-pivot) minimal synth loop.
+"""End-to-end tests for the autoresearch loop (new KKT-time-to-target API).
 
-Linux-runnable. Drives `run_synth_loop` end-to-end with a stub proposer over
-a tiny FISTA-LASSO problem so the loop's gating, lineage write, and
-champion update behaviour are unit-testable without an LLM in the path.
+Linux-runnable via the native numpy `solve()` contract — no LLM, no MLX. Drives
+`run_synth_loop` with a stub proposer so the loop's scoring, lineage/tree
+write, checkpoint, and research-state behaviour are unit-testable.
 """
+
 from __future__ import annotations
 
 import json
@@ -21,226 +22,107 @@ from convexkernels.synth.proposers.stub import StubProposer
 @pytest.fixture
 def tiny_lasso() -> Lasso:
     rng = np.random.default_rng(0)
-    A = rng.standard_normal((200, 100))
-    x_true = rng.standard_normal(100) * (rng.random(100) < 0.1)
-    b = A @ x_true + 1e-2 * rng.standard_normal(200)
+    A = rng.standard_normal((120, 60))
+    x_true = rng.standard_normal(60) * (rng.random(60) < 0.1)
+    b = A @ x_true + 1e-2 * rng.standard_normal(120)
     return Lasso(A, b, lam=0.1 * float(np.max(np.abs(A.T @ b))))
 
 
-_NUMPY_REF_SOURCE = '''
-import numpy as np
-from dataclasses import dataclass
-from convexkernels.frontend.problem import Problem
-
-
-@dataclass
-class FistaState:
-    x: np.ndarray
-    y: np.ndarray
-    theta: float
-
-
-def init_state(problem: Problem) -> FistaState:
-    n = problem.n
-    return FistaState(x=np.zeros(n), y=np.zeros(n), theta=1.0)
-
-
-def fista_step(state: FistaState, problem: Problem, t: float) -> FistaState:
-    g = problem.grad_smooth(state.y)
-    x_next = problem.prox(state.y - t * g, t)
-    theta_next = (1.0 + np.sqrt(1.0 + 4.0 * state.theta * state.theta)) / 2.0
-    momentum = (state.theta - 1.0) / theta_next
-    y_next = x_next + momentum * (x_next - state.x)
-    return FistaState(x=x_next, y=y_next, theta=theta_next)
-'''
-
-
 def _slot() -> Slot:
-    return Slot(problem_family="lasso", algorithm="fista", hardware="linux_x86_64", dtype="fp64")
+    return Slot("lasso", "open", "linux_x86", "open")
 
 
-def test_loop_runs_baseline_and_logs(tmp_path: Path, tiny_lasso: Lasso) -> None:
-    """Loop runs the baseline measurement, accepts no proposals (n=0)."""
-    rows = run_synth_loop(
-        proposer=StubProposer([]),
-        problem=tiny_lasso,
-        seed_kernel={
-            "module": "convexkernels.kernels.numpy_ref",
-            "step": "fista_step",
-            "init": "init_state",
-        },
-        slot=_slot(),
-        state_root=tmp_path,
-        n_proposals=0,
-        algorithm="fista",
-        max_iters=2000,
-        fitness_tol=1e-6,
-        reps=2,
-        speedup_margin=0.97,
-        warmup_runs=0,
-    )
-    assert rows == []
-    assert (tmp_path / "runs").exists()
-
-
-_SLOWER_SOURCE = '''
+# A candidate that converges (a valid solve), used to exercise acceptance.
+_GOOD_SOLVE = '''
 import numpy as np
-import time
-from dataclasses import dataclass
-from convexkernels.frontend.problem import Problem
+def solve(problem, recorder, *, kkt_tol, max_time_s):
+    x = np.zeros(problem.n); y = x.copy(); theta = 1.0
+    t = 1.0 / problem.L
+    for it in range(1, 100000):
+        g = problem.grad_smooth(y)
+        xn = problem.prox(y - t*g, t)
+        if float(np.dot(y - xn, xn - x)) > 0.0:
+            tn, mom = 1.0, 0.0
+        else:
+            tn = 0.5*(1.0 + np.sqrt(1.0 + 4.0*theta*theta)); mom = (theta-1.0)/tn
+        y = xn + mom*(xn - x); x = xn; theta = tn
+        if it % 5 == 0:
+            recorder.record(x)
+            if recorder.should_stop(kkt_tol):
+                break
+    recorder.record(x)
+    return x
+'''
 
-
-@dataclass
-class FistaState:
-    x: np.ndarray
-    y: np.ndarray
-    theta: float
-
-
-def init_state(problem: Problem) -> FistaState:
-    n = problem.n
-    return FistaState(x=np.zeros(n), y=np.zeros(n), theta=1.0)
-
-
-def fista_step(state: FistaState, problem: Problem, t: float) -> FistaState:
-    # Inject ~5 ms of extra work to guarantee this is slower than the baseline.
-    time.sleep(0.005)
-    g = problem.grad_smooth(state.y)
-    x_next = problem.prox(state.y - t * g, t)
-    theta_next = (1.0 + np.sqrt(1.0 + 4.0 * state.theta * state.theta)) / 2.0
-    momentum = (state.theta - 1.0) / theta_next
-    y_next = x_next + momentum * (x_next - state.x)
-    return FistaState(x=x_next, y=y_next, theta=theta_next)
+# A candidate that never reaches the target (returns zeros).
+_BAD_SOLVE = '''
+import numpy as np
+def solve(problem, recorder, *, kkt_tol, max_time_s):
+    x = np.zeros(problem.n)
+    recorder.record(x)
+    return x
 '''
 
 
-def test_loop_rejects_strictly_slower_candidate(tmp_path: Path, tiny_lasso: Lasso) -> None:
-    """A candidate that adds 5ms per iter is unconditionally slower → rejected."""
-    rows = run_synth_loop(
-        proposer=StubProposer([("inject sleep", _SLOWER_SOURCE)]),
-        problem=tiny_lasso,
-        seed_kernel={
-            "module": "convexkernels.kernels.numpy_ref",
-            "step": "fista_step",
-            "init": "init_state",
-        },
+def _common_kwargs(tmp_path: Path, proposer):
+    return dict(
+        proposer=proposer,
+        seed_kernel={"module": "convexkernels.kernels.numpy_solve_ref"},
         slot=_slot(),
         state_root=tmp_path,
-        n_proposals=1,
-        algorithm="fista",
-        max_iters=200,  # short cap so the sleep doesn't take forever
-        fitness_tol=1e-3,  # allow this small max_iters to "converge" loosely
+        problem_backend="native",
+        kkt_tol=1e-6,
+        max_time_s=20.0,
         reps=1,
-        speedup_margin=0.97,
         warmup_runs=0,
+        compute_baselines=False,
+        verbose=False,
     )
+
+
+def test_loop_logs_and_roots_tree(tmp_path: Path, tiny_lasso: Lasso):
+    proposer = StubProposer([("noop reject", _BAD_SOLVE)])
+    rows = run_synth_loop(problem=tiny_lasso, n_proposals=1,
+                          **_common_kwargs(tmp_path, proposer))
     assert len(rows) == 1
     assert rows[0].decision["accepted"] is False
-    assert "not_faster_than_baseline" in rows[0].decision["reason"]
+    assert "did_not_reach_target" in rows[0].decision["reason"]
+    # seed checkpoint roots the tree; rejected experiment links to it
+    ckpts = list((tmp_path / "checkpoints").iterdir())
+    assert len(ckpts) == 1  # only the seed (rejected candidate is not a node)
+    assert rows[0].parent_id == ckpts[0].name
+    assert (tmp_path / "research_state.json").exists()
+    assert (tmp_path / "lineage.jsonl").exists()
 
 
-def test_loop_records_proposer_crash(tmp_path: Path, tiny_lasso: Lasso) -> None:
-    class BadProposer:
-        def propose(self, ctx):  # noqa: ARG002
-            raise RuntimeError("boom")
+def test_loop_rejects_slower_valid_candidate(tmp_path: Path, tiny_lasso: Lasso):
+    # The good solve is the same algorithm as the seed → not faster → reject.
+    proposer = StubProposer([("same algo", _GOOD_SOLVE)])
+    rows = run_synth_loop(problem=tiny_lasso, n_proposals=1,
+                          **_common_kwargs(tmp_path, proposer))
+    assert rows[0].score is not None
+    assert rows[0].score["reached_target"] is True
+    # valid but not faster than the seed champion
+    assert not rows[0].decision["accepted"]
+    assert "not_faster_than_champion" in rows[0].decision["reason"]
 
-    rows = run_synth_loop(
-        proposer=BadProposer(),
-        problem=tiny_lasso,
-        seed_kernel={
-            "module": "convexkernels.kernels.numpy_ref",
-            "step": "fista_step",
-            "init": "init_state",
-        },
-        slot=_slot(),
-        state_root=tmp_path,
-        n_proposals=1,
-        algorithm="fista",
-        max_iters=2000,
-        fitness_tol=1e-6,
-        reps=2,
-        speedup_margin=0.97,
-        warmup_runs=0,
-    )
+
+def test_loop_records_proposer_crash(tmp_path: Path, tiny_lasso: Lasso):
+    proposer = StubProposer([])  # exhausted → raises → recorded as crash
+    rows = run_synth_loop(problem=tiny_lasso, n_proposals=1,
+                          **_common_kwargs(tmp_path, proposer))
     assert len(rows) == 1
-    assert "crash:proposer_error:RuntimeError" in rows[0].decision["reason"]
+    assert not rows[0].decision["accepted"]
+    assert rows[0].decision["reason"].startswith("crash:proposer_error")
 
 
-def test_loop_records_kkt_above_tol(tmp_path: Path, tiny_lasso: Lasso) -> None:
-    """Source that doesn't actually update x → fitness stays high → discard."""
-    BROKEN_SOURCE = '''
-import numpy as np
-from dataclasses import dataclass
-from convexkernels.frontend.problem import Problem
-
-
-@dataclass
-class FistaState:
-    x: np.ndarray
-    y: np.ndarray
-    theta: float
-
-
-def init_state(problem):
-    n = problem.n
-    return FistaState(x=np.zeros(n), y=np.zeros(n), theta=1.0)
-
-
-def fista_step(state, problem, t):
-    return state  # no-op: KKT will not improve
-'''
-    rows = run_synth_loop(
-        proposer=StubProposer([("no-op step", BROKEN_SOURCE)]),
-        problem=tiny_lasso,
-        seed_kernel={
-            "module": "convexkernels.kernels.numpy_ref",
-            "step": "fista_step",
-            "init": "init_state",
-        },
-        slot=_slot(),
-        state_root=tmp_path,
-        n_proposals=1,
-        algorithm="fista",
-        max_iters=200,  # short cap so the no-op doesn't loop forever
-        fitness_tol=1e-6,
-        reps=1,
-        speedup_margin=0.97,
-        warmup_runs=0,
-    )
-    assert len(rows) == 1
-    reason = rows[0].decision["reason"]
-    assert "discard:" in reason and ("not_converged" in reason or "kkt_above_tol" in reason)
-
-
-def test_loop_writes_lineage_and_champion(tmp_path: Path, tiny_lasso: Lasso) -> None:
-    """Lineage JSONL is written; champion.py is created when a candidate is kept."""
-    # Use a faster numpy_ref-equivalent that should beat the baseline by a
-    # margin: skip the prox redundancy by inlining. We'll just stub a small
-    # speedup via larger step (likely faster but still valid).
-    SPEEDIER = _NUMPY_REF_SOURCE.replace("0.5 * problem.L", "0.6 * problem.L")  # no-op for our test
-    rows = run_synth_loop(
-        proposer=StubProposer([
-            ("identity 1", _NUMPY_REF_SOURCE),
-            ("identity 2", SPEEDIER),
-        ]),
-        problem=tiny_lasso,
-        seed_kernel={
-            "module": "convexkernels.kernels.numpy_ref",
-            "step": "fista_step",
-            "init": "init_state",
-        },
-        slot=_slot(),
-        state_root=tmp_path,
-        n_proposals=2,
-        algorithm="fista",
-        max_iters=2000,
-        fitness_tol=1e-6,
-        reps=1,
-        speedup_margin=0.97,
-        warmup_runs=0,
-    )
-    lineage = (tmp_path / "lineage.jsonl").read_text().splitlines()
-    assert len(lineage) == 2
-    parsed = [json.loads(line) for line in lineage]
-    assert all("decision" in row for row in parsed)
-    assert all("score" in row for row in parsed)
+def test_research_state_tracks_baseline_bar(tmp_path: Path, tiny_lasso: Lasso):
+    proposer = StubProposer([("noop", _BAD_SOLVE)])
+    kwargs = _common_kwargs(tmp_path, proposer)
+    kwargs["compute_baselines"] = True
+    kwargs["baseline_solvers"] = ("CLARABEL", "SCS")
+    run_synth_loop(problem=tiny_lasso, n_proposals=1, **kwargs)
+    state = json.loads((tmp_path / "research_state.json").read_text())
+    assert "bar_to_beat" in state
+    assert set(state["bar_to_beat"]["all_baselines_time_to_kkt_s"]) == {"CLARABEL", "SCS"}
+    assert state["champion"] is not None

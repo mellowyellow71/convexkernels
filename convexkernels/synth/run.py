@@ -86,51 +86,36 @@ def _make_problem(problem_family: str, shape_name: str):
     raise ValueError(f"unknown problem_family {problem_family!r}")
 
 
-def _default_seed_kernel(problem_family: str, algorithm: str, backend: str) -> dict:
-    """Resolve a seed kernel module/step/init by (problem_family, algorithm, backend)."""
+# Public alias (used by scripts/plot_gap_time.py).
+make_problem = _make_problem
+
+
+def _default_seed_kernel(problem_family: str, backend: str) -> dict:
+    """Resolve a seed kernel exposing `solve()` by (problem_family, backend).
+
+    Algorithm is no longer part of the spec — the seed is just the starting
+    point for the open search. Each seed module exposes `solve(problem,
+    recorder, *, kkt_tol, max_time_s)`.
+    """
     if backend == "mlx":
-        if problem_family == "lasso" and algorithm == "fista":
-            return {"module": "convexkernels.kernels.mlx.seeds.fista_step_v0",
-                    "step": "fista_step", "init": "init_state"}
-        if problem_family == "nonneg_lasso" and algorithm == "fista":
-            return {"module": "convexkernels.kernels.mlx.seeds.nonnegative_fista_step_v0",
-                    "step": "fista_step", "init": "init_state"}
-        if problem_family == "total_variation_1d" and algorithm == "pdhg":
-            return {"module": "convexkernels.kernels.mlx.seeds.pdhg_step_v0",
-                    "step": "pdhg_step", "init": "init_state"}
-        if problem_family == "basis_pursuit" and algorithm == "pdhg":
-            return {"module": "convexkernels.kernels.mlx.seeds.pdhg_bp_step_v0",
-                    "step": "pdhg_step", "init": "init_state"}
-        if problem_family == "equality_qp" and algorithm == "alm":
-            return {"module": "convexkernels.kernels.mlx.seeds.alm_step_v0",
-                    "step": "alm_step", "init": "init_state"}
-        if problem_family == "lasso_admm" and algorithm == "admm":
-            return {"module": "convexkernels.kernels.mlx.seeds.admm_lasso_step_v0",
-                    "step": "admm_step", "init": "init_state"}
-        if problem_family == "lasso_path" and algorithm == "fista_gram":
-            return {"module": "convexkernels.kernels.mlx.seeds.gram_fista_path_v0",
-                    "step": "fista_path_step", "init": "init_state"}
+        if problem_family == "lasso_path":
+            return {"module": "convexkernels.kernels.mlx.seeds.gram_fista_path_v0"}
+        if problem_family in {"lasso", "nonneg_lasso"}:
+            return {"module": "convexkernels.kernels.mlx.seeds.fista_step_v0"}
     elif backend == "native":
-        if algorithm == "fista":
-            return {"module": "convexkernels.kernels.numpy_ref",
-                    "step": "fista_step", "init": "init_state"}
-        if algorithm == "pdhg":
-            return {"module": "convexkernels.kernels.numpy_pdhg_ref",
-                    "step": "pdhg_step", "init": "init_state"}
-        if algorithm == "alm":
-            return {"module": "convexkernels.kernels.numpy_alm_ref",
-                    "step": "alm_step", "init": "init_state"}
-        if algorithm == "admm":
-            return {"module": "convexkernels.kernels.numpy_admm_ref",
-                    "step": "admm_step", "init": "init_state"}
-    raise ValueError(f"no default seed for ({problem_family}, {algorithm}, backend={backend})")
+        if problem_family in {"lasso", "nonneg_lasso", "lasso_path"}:
+            return {"module": "convexkernels.kernels.numpy_solve_ref"}
+    raise ValueError(f"no default solve-seed for ({problem_family}, backend={backend})")
 
 
 def _parse_slot_spec(slot_str: str) -> Slot:
+    """Spec is `problem_family/hardware`. Algorithm/dtype are open (search
+    space), kept on the Slot as the constant tag "open" for telemetry."""
     parts = slot_str.split("/")
-    if len(parts) != 4:
-        raise ValueError(f"slot must be problem_family/algorithm/hardware/dtype, got {slot_str!r}")
-    pf, algo, hw, dt = parts
+    if len(parts) != 2:
+        raise ValueError(f"slot must be problem_family/hardware, got {slot_str!r}")
+    pf, hw = parts
+    algo, dt = "open", "open"
     if hw == "auto":
         hw = detect_hardware()
     return Slot(problem_family=pf, algorithm=algo, hardware=hw, dtype=dt)
@@ -138,47 +123,38 @@ def _parse_slot_spec(slot_str: str) -> Slot:
 
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser()
-    p.add_argument("--slot", required=True, help="problem_family/algorithm/hardware/dtype")
-    p.add_argument("--shape", required=True, help="bench shape name (e.g. tall_medium, tv1d_medium)")
+    p.add_argument("--slot", required=True, help="problem_family/hardware (e.g. lasso_path/apple_silicon)")
+    p.add_argument("--shape", required=True, help="bench shape name (e.g. path_tall_medium)")
     p.add_argument("--seed", default=None, help="seed kernel module dotted-path (auto if omitted)")
-    p.add_argument("--seed-step", default=None, help="seed kernel step function name")
-    p.add_argument("--seed-init", default=None, help="seed kernel init function name")
-    p.add_argument("--default-step-name", default=None, help=argparse.SUPPRESS)
     p.add_argument("--proposer", choices=["openai", "stub"], default="openai")
     p.add_argument("--model", default="gpt-5.5", help="OpenAI model name")
     p.add_argument("--reasoning-effort", default="medium")
     p.add_argument("--api-timeout-s", type=float, default=240.0)
     p.add_argument("--n-proposals", type=int, default=50)
-    p.add_argument("--reps", type=int, default=5)
-    p.add_argument("--max-iters", type=int, default=5000)
-    p.add_argument("--fitness-tol", type=float, default=1e-6)
-    p.add_argument("--speedup-margin", type=float, default=0.97)
-    p.add_argument("--variant", default="basic")
+    p.add_argument("--reps", type=int, default=3)
+    p.add_argument("--kkt-tol", type=float, default=1e-6, help="trusted KKT target")
+    p.add_argument("--max-time-s", type=float, default=60.0, help="per-solve wall budget")
+    p.add_argument("--margin", type=float, default=0.97, help="must be this much faster than champion")
     p.add_argument("--problem-backend", choices=["native", "mlx"], default="mlx")
     p.add_argument("--problem-dtype", choices=["fp32", "fp16"], default="fp32")
-    p.add_argument("--cost-model", choices=["single", "amortized"], default="single")
+    p.add_argument("--dtype-strategy", default="fp32")
     p.add_argument("--warmup-runs", type=int, default=1)
     p.add_argument("--timeout-s", type=float, default=120.0)
     p.add_argument("--state-root", required=True, type=Path)
     p.add_argument("--program-md", default="convexkernels/synth/program.md", type=Path)
+    p.add_argument("--resume-from", default=None, help="checkpoint id to branch from")
+    p.add_argument("--no-baselines", action="store_true", help="skip the baseline panel")
+    p.add_argument("--baseline-solvers", default="CLARABEL,SCS,OSQP,ECOS")
     p.add_argument("--verbose", action="store_true", default=True)
     args = p.parse_args(argv)
 
     slot = _parse_slot_spec(args.slot)
     problem = _make_problem(slot.problem_family, args.shape)
     if args.seed is None:
-        seed_kernel = _default_seed_kernel(
-            slot.problem_family, slot.algorithm, args.problem_backend,
-        )
+        seed_kernel = _default_seed_kernel(slot.problem_family, args.problem_backend)
     else:
-        default_step = {"pdhg": "pdhg_step", "alm": "alm_step",
-                        "admm": "admm_step", "fista_gram": "fista_path_step",
-                        "fista_path": "fista_path_step"}.get(slot.algorithm, "fista_step")
-        seed_kernel = {
-            "module": args.seed,
-            "step": args.seed_step or default_step,
-            "init": args.seed_init or "init_state",
-        }
+        seed_kernel = {"module": args.seed}
+
     program_md = ""
     if args.program_md and args.program_md.exists():
         program_md = args.program_md.read_text()
@@ -199,18 +175,19 @@ def main(argv: list[str] | None = None) -> int:
         slot=slot,
         state_root=args.state_root,
         n_proposals=args.n_proposals,
-        algorithm=slot.algorithm,
-        variant=args.variant,
-        fitness_tol=args.fitness_tol,
-        max_iters=args.max_iters,
+        kkt_tol=args.kkt_tol,
+        max_time_s=args.max_time_s,
         reps=args.reps,
-        speedup_margin=args.speedup_margin,
+        margin=args.margin,
         problem_backend=args.problem_backend,
         problem_dtype=args.problem_dtype,
-        cost_model=args.cost_model,
+        dtype_strategy=args.dtype_strategy,
         warmup_runs=args.warmup_runs,
         timeout_s=args.timeout_s,
         program_md=program_md,
+        resume_from=args.resume_from,
+        compute_baselines=not args.no_baselines,
+        baseline_solvers=tuple(s.strip() for s in args.baseline_solvers.split(",") if s.strip()),
         verbose=args.verbose,
     )
 
@@ -218,7 +195,8 @@ def main(argv: list[str] | None = None) -> int:
     discarded = len(rows) - accepted
     print(f"\nsession complete: {accepted} kept / {discarded} discarded across {len(rows)} proposals")
     print(f"lineage: {args.state_root}/lineage.jsonl")
-    print(f"champion source: {args.state_root}/champion.py")
+    print(f"checkpoints: {args.state_root}/checkpoints/")
+    print(f"research state: {args.state_root}/research_state.json")
     return 0
 
 

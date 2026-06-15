@@ -145,7 +145,29 @@ def to_host_state(state: FistaPathStateMLX) -> FistaPathState:
     return FistaPathState(X=state.X, Y=state.Y, theta=state.theta)
 
 
+def solve(problem, recorder, *, kkt_tol, max_time_s, check_every: int = 25):
+    """Algorithm-open seed entry point: batched FISTA-Gram path owning its loop.
+
+    `problem` is the prepared `LassoPathGramMLX` (Gram or direct form chosen in
+    `prepare_problem`). Progress is reported on the (n, K) iterate `state.X`
+    through the trusted `Recorder`; checkpointing every `check_every` iters also
+    bounds the MLX lazy graph. Stops at the KKT target or the wall budget.
+    """
+    state = init_state(problem)
+    t = 1.0 / problem.L
+    it = 0
+    while it < 100000:
+        it += 1
+        state = fista_path_step(state, problem, t)
+        if it % check_every == 0:
+            recorder.record(state.X)
+            if recorder.should_stop(kkt_tol):
+                break
+    recorder.record(state.X)
+    return state.X
+
+
 __all__ = [
     "FistaPathStateMLX", "prepare_problem", "init_state",
-    "fista_path_step", "kkt_max", "to_host_state",
+    "fista_path_step", "kkt_max", "to_host_state", "solve",
 ]

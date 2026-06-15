@@ -138,28 +138,31 @@ def _format_prompt(ctx: dict) -> str:
     """
     slot = ctx["slot"]
     score = ctx["current_score"]
-    fitness_kind = score.get("fitness_kind", "kkt")
-    traj = score.get("fitness_trajectory") or []
-    history = ctx.get("history", [])
+    state = ctx.get("research_state") or {}
+    traj = score.get("trajectory") or []
     program = (ctx.get("program_md") or "").strip()
     src_path = ctx.get("current_source_path") or "<unknown>"
+    kkt_tol = ctx.get("kkt_tol", 1e-6)
+    margin = ctx.get("margin", 0.97)
 
     sections: list[str] = []
     sections.append(
-        "You are a kernel-synthesis proposer for a KKT/gap-gated autoresearch loop. "
-        "You rewrite a single Python file that defines `pdhg_step` (or `fista_step`) "
-        "and `init_state`. The harness evaluates your candidate in a sandbox, gates "
-        "on convergence and speedup, and either keeps your version as the new best "
-        "or discards it. Be concrete: name the operations you fuse, the launches "
-        "you eliminate, the dtype/storage choice. Do not propose changes that break "
-        "the public interface or violate the convergence contract."
+        "You are a solver-synthesis proposer for a KKT-verified autoresearch loop. "
+        "You rewrite a single Python module that defines "
+        "`solve(problem, recorder, *, kkt_tol, max_time_s) -> X` (and optionally "
+        "`prepare_problem`). The algorithm is YOURS to choose — FISTA, ADMM, PDHG, "
+        "coordinate descent, screening, reduced precision, quantization, custom "
+        "Metal kernels — anything convex-correct. The harness times your solve and "
+        "verifies optimality with a TRUSTED KKT residual it computes itself (you "
+        "cannot fake it). Keep the candidate iff it reaches the target faster than "
+        "the current champion. Be concrete about the algorithm and the kernels."
     )
 
     if program:
         sections.append("--- program.md (research org code) ---")
         sections.append(program)
 
-    sections.append("--- slot ---")
+    sections.append("--- spec (problem / hardware) ---")
     sections.append(json.dumps(slot, indent=2))
 
     sections.append("--- current source ---")
@@ -168,58 +171,67 @@ def _format_prompt(ctx: dict) -> str:
     sections.append(ctx.get("current_source", ""))
     sections.append("```")
 
-    sections.append("--- current score (multi-rep, n_reps={}) ---".format(score.get("n_reps", 1)))
+    sections.append("--- current champion score (median over {} reps) ---".format(score.get("n_reps", 1)))
     sections.append(
-        "converged={}; {} median={:.3e}; iters={};\n"
-        "solve_ms median={:.3f}, min={:.3f}, max={:.3f}, std={:.3f}\n"
-        "setup_ms median={:.3f}".format(
-            score.get("converged"),
-            fitness_kind,
-            score.get("fitness_final", 0.0),
-            score.get("iters", 0),
-            score.get("solve_ms_median", 0.0),
-            score.get("solve_ms_min", 0.0),
-            score.get("solve_ms_max", 0.0),
-            score.get("solve_ms_std", 0.0),
-            score.get("setup_ms_median", 0.0),
+        "reached_target={}; kkt_final={:.3e}; time_to_kkt_s={}; total_time_s={} "
+        "(setup_s={:.4f})".format(
+            score.get("reached_target"),
+            score.get("kkt_final", 0.0),
+            _fmt_s(score.get("time_to_kkt_s")),
+            _fmt_s(score.get("total_time_s")),
+            score.get("setup_s", 0.0),
         )
     )
 
     if traj:
-        formatted = ", ".join(f"{v:.2e}" for v in traj)
-        sections.append(f"fitness trajectory (compressed, ~9 points across {score.get('iters', 0)} iters): {formatted}")
-        if len(traj) >= 2 and traj[0] > 0 and traj[-1] / max(traj[0], 1e-30) < 1e-3:
-            sections.append("(monotone descent — no obvious stall)")
-        elif len(traj) >= 2 and traj[-1] > traj[0]:
-            sections.append("(WARNING: trajectory is increasing — divergence)")
+        pts = ", ".join(f"({t:.3f}s,{k:.1e})" for t, k in traj[:12])
+        sections.append(f"KKT-vs-time trajectory (t, kkt): {pts}")
 
-    sections.append("--- history (last {} proposals on this slot) ---".format(len(history)))
-    if history:
-        for h in history:
-            sections.append(json.dumps(h, default=str))
+    bar = state.get("bar_to_beat") or {}
+    sections.append("--- bar to beat (classical baselines, time_to_kkt_s) ---")
+    sections.append(
+        "best baseline: {} @ {}\nall: {}".format(
+            bar.get("best_baseline"),
+            _fmt_s(bar.get("best_baseline_time_to_kkt_s")),
+            json.dumps(bar.get("all_baselines_time_to_kkt_s") or {}, default=str),
+        )
+    )
+
+    tried = state.get("tried_directions") or []
+    sections.append("--- tried directions (curated; don't repeat failures) ---")
+    if tried:
+        for t in tried:
+            sections.append(json.dumps(t, default=str))
     else:
-        sections.append("(empty — first proposal on this slot)")
+        sections.append("(none yet — first proposal)")
 
     sections.append("--- target metric ---")
     sections.append(
-        "fitness ({fk}) must be < {tol:.1e}. solve_ms median must be < "
-        "{margin} * current best (i.e. >= {pct:.1f}% faster). cost model: {cm}.".format(
-            fk=fitness_kind,
-            tol=ctx.get("fitness_tol", 1e-6),
-            margin=ctx.get("speedup_margin", 0.97),
-            pct=(1.0 - ctx.get("speedup_margin", 0.97)) * 100,
-            cm=ctx.get("cost_model", "single"),
+        "Reach trusted KKT < {tol:.1e} (the hard correctness gate). Your "
+        "total_time_s (setup + time_to_kkt) must be < {margin} * the champion's "
+        "(i.e. ≥{pct:.1f}% faster) to be kept. Beating the baseline bar above is "
+        "the real goal.".format(
+            tol=kkt_tol, margin=margin, pct=(1.0 - margin) * 100,
         )
     )
 
     sections.append("--- output ---")
     sections.append(
         "Return JSON with two fields:\n"
-        "  rationale: one paragraph stating what changed and why it should be faster.\n"
-        "  full_source: the complete replacement Python module source.\n"
+        "  rationale: one paragraph naming the algorithm + the concrete change and "
+        "why it should reach the KKT target sooner.\n"
+        "  full_source: the complete replacement Python module (defines `solve`).\n"
         "Do not wrap in markdown code fences. Do not include explanatory text outside the JSON."
     )
     return "\n\n".join(sections)
+
+
+def _fmt_s(v) -> str:
+    import math as _math
+
+    if isinstance(v, (int, float)) and _math.isfinite(v):
+        return f"{v:.4f}s"
+    return "—"
 
 
 def _extract_response_text(response: Any) -> str:

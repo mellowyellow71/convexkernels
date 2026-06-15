@@ -139,9 +139,9 @@ def test_mlx_fista_path_converges_small():
     prob_gram = prepare_problem(prob_mlx)
 
     res = fista_path(
-        prob, max_iters=20000, tol=1e-6, convergence_check_every=10,
+        prob_gram, max_iters=20000, tol=1e-6, convergence_check_every=10,
         kernel_step=fista_path_step, kernel_init=init_state,
-        kernel_kkt_max=kkt_max, kernel_problem=prob_gram,
+        kernel_kkt_max=kkt_max,
     )
     assert res.converged, (
         f"MLX path solver did not converge in {res.n_iters} iters; "
