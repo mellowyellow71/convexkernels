@@ -282,7 +282,9 @@ def run_synth_loop(
     program_md: str = "",
     resume_from: Optional[str] = None,
     compute_baselines: bool = True,
-    baseline_solvers: tuple[str, ...] = ("CLARABEL", "SCS", "OSQP", "ECOS"),
+    baseline_solvers: tuple[str, ...] = (
+        "CLARABEL", "SCS", "OSQP", "ECOS", "sklearn", "adelie",
+    ),
     verbose: bool = False,
 ) -> list[LineageRow]:
     """Run a full autoresearch session. Durable state under `state_root`:

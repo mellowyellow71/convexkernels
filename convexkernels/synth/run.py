@@ -144,7 +144,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--program-md", default="convexkernels/synth/program.md", type=Path)
     p.add_argument("--resume-from", default=None, help="checkpoint id to branch from")
     p.add_argument("--no-baselines", action="store_true", help="skip the baseline panel")
-    p.add_argument("--baseline-solvers", default="CLARABEL,SCS,OSQP,ECOS")
+    p.add_argument("--baseline-solvers", default="CLARABEL,SCS,OSQP,ECOS,sklearn,adelie")
     p.add_argument("--verbose", action="store_true", default=True)
     args = p.parse_args(argv)
 
