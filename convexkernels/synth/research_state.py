@@ -33,8 +33,14 @@ def build_research_state(
     champion: Optional[dict],
     kkt_tol: float,
     max_ideas: int = 12,
+    cost_model: Optional[dict] = None,
 ) -> dict:
-    """Assemble the compact state dict from the durable tree + baselines."""
+    """Assemble the compact state dict from the durable tree + baselines.
+
+    `cost_model` is an optional analytical bandwidth/AI hint for the active
+    problem shape (see `synth.roofline.roofline_hint`); it steers the open
+    algorithm search toward the bandwidth-favourable gradient form.
+    """
     ranked_baselines = sorted(
         ((name, t) for name, t in baseline_times.items()),
         key=lambda kv: kv[1],
@@ -68,7 +74,7 @@ def build_research_state(
 
     digest = accepted + discarded[: max(0, max_ideas - len(accepted))]
 
-    return {
+    state = {
         "kkt_tol": kkt_tol,
         "champion": champion,
         "bar_to_beat": {
@@ -82,6 +88,9 @@ def build_research_state(
             1 for r in lineage_rows if (r.get("decision") or {}).get("accepted")
         ),
     }
+    if cost_model is not None:
+        state["hardware_cost_model"] = cost_model
+    return state
 
 
 def write_research_state(path: Path, state: dict) -> None:
