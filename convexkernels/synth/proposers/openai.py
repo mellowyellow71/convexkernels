@@ -76,7 +76,7 @@ class OpenAIProposer:
                     "schema": {
                         "type": "object",
                         "additionalProperties": False,
-                        "required": ["rationale", "full_source"],
+                        "required": ["rationale", "full_source", "algorithm_family"],
                         "properties": {
                             "rationale": {
                                 "type": "string",
@@ -84,6 +84,17 @@ class OpenAIProposer:
                                     "One paragraph: what is being changed, why this should "
                                     "be faster, and which constraint (KKT/gap, semantics, "
                                     "interface) it preserves."
+                                ),
+                            },
+                            "algorithm_family": {
+                                "type": "string",
+                                "description": (
+                                    "Short snake_case tag for the algorithmic approach, e.g. "
+                                    "'fista_gram', 'fista_direct', 'admm', 'pdhg', "
+                                    "'coordinate_descent', 'prox_newton', 'screening_fista'. "
+                                    "Used to dedup tried directions, so keep it stable across "
+                                    "proposals that share an approach and distinct across "
+                                    "genuinely different ones."
                                 ),
                             },
                             "full_source": {
@@ -111,6 +122,7 @@ class OpenAIProposer:
 
         rationale = str(parsed.get("rationale", "")).strip()
         source = str(parsed.get("full_source", ""))
+        algorithm_family = str(parsed.get("algorithm_family", "")).strip()
         if not source.strip():
             raise RuntimeError("openai returned empty full_source")
         return Edit(
@@ -119,6 +131,7 @@ class OpenAIProposer:
             full_source=source,
             proposer_role="impl",
             proposer_model=self.model,
+            algorithm_family=algorithm_family,
         )
 
 
