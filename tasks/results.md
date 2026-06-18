@@ -2156,3 +2156,29 @@ schedule edits and forces a new lever each proposal, or (b) moving on.
 
 ### Hero scorecard (5-rep confirmed champion is batch-1's, both ~3×)
 - Adelie 4.13s → champion ~1.3s → **~3.2–3.3× faster**, KKT-verified. Goal met.
+
+## Reframe — full-shape scorecard, seed vs Adelie (clean fast-L metric) (2026-06-18)
+
+After merging the reframe + Ajay's #4/#5/#6 to master, ran the seed (batched
+FISTA, Gram-or-direct dispatch) against the rigorous cached 5-rep Adelie
+reference on all four path shapes, kkt_tol=1e-5, fast-L (setup negligible),
+reps=3. The loop auto-emits the ranked panel summary + KKT-vs-time plot per shape.
+
+| shape | (m, n) | seed time-to-KKT<1e-5 | Adelie | seed vs Adelie |
+|---|---|---:|---:|---:|
+| path_wide_small | (500, 2000) | 92 ms | 41 ms | 0.44× (lose) |
+| path_tall_medium | (5000, 2000) | 50 ms | 146 ms | **2.90×** |
+| path_square | (10000, 10000) | 898 ms | 1078 ms | **1.20×** |
+| path_wide_hero | (1000, 50000) | 12.3 s | 4.13 s | 0.34× (lose) |
+| path_wide_hero (active-set champion) | (1000, 50000) | **1.375 s** | 4.13 s | **3.01×** |
+
+**Read:** the hand seed already beats Adelie where the Gram precompute fits and
+amortizes across the path (tall_medium 2.9×, square 1.2×). It loses where Gram
+is too big (hero: G is 10 GB → direct two-matmul gradient, no screening) or the
+problem is too small to amortize setup (wide_small). The autoresearch payoff is
+clearest on hero, where the active-set champion turns a 0.34× loss into a 3.01×
+win — recovering Adelie's screening edge inside the batched-FISTA form.
+
+Open follow-ups: (a) does the active-set champion transfer to wide_small?
+(b) anti-rut program.md + a fresh hero batch to push past 3×; (c) second
+specimen (quantized RAG/NN search).
