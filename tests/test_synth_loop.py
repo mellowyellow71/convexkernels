@@ -54,6 +54,33 @@ def solve(problem, recorder, *, kkt_tol, max_time_s):
     return x
 '''
 
+# Same algorithm + result as _GOOD_SOLVE but with a fixed upfront delay so it is
+# reliably NOT faster than the seed champion (the delay counts as solve time;
+# the recorder only excludes KKT-eval overhead). This makes the speed-gate
+# rejection deterministic instead of a wall-clock coin flip on near-equal solves.
+_SLOW_SOLVE = '''
+import time
+import numpy as np
+def solve(problem, recorder, *, kkt_tol, max_time_s):
+    time.sleep(0.05)            # >> the tiny-problem solve time -> reliably slower
+    x = np.zeros(problem.n); y = x.copy(); theta = 1.0
+    t = 1.0 / problem.L
+    for it in range(1, 100000):
+        g = problem.grad_smooth(y)
+        xn = problem.prox(y - t*g, t)
+        if float(np.dot(y - xn, xn - x)) > 0.0:
+            tn, mom = 1.0, 0.0
+        else:
+            tn = 0.5*(1.0 + np.sqrt(1.0 + 4.0*theta*theta)); mom = (theta-1.0)/tn
+        y = xn + mom*(xn - x); x = xn; theta = tn
+        if it % 5 == 0:
+            recorder.record(x)
+            if recorder.should_stop(kkt_tol):
+                break
+    recorder.record(x)
+    return x
+'''
+
 # A candidate that never reaches the target (returns zeros).
 _BAD_SOLVE = '''
 import numpy as np
@@ -97,7 +124,7 @@ def test_loop_logs_and_roots_tree(tmp_path: Path, tiny_lasso: Lasso):
 
 def test_loop_rejects_slower_valid_candidate(tmp_path: Path, tiny_lasso: Lasso):
     # The good solve is the same algorithm as the seed → not faster → reject.
-    proposer = StubProposer([("same algo", _GOOD_SOLVE)])
+    proposer = StubProposer([("same algo, slower", _SLOW_SOLVE)])
     rows = run_synth_loop(problem=tiny_lasso, n_proposals=1,
                           **_common_kwargs(tmp_path, proposer))
     assert rows[0].score is not None

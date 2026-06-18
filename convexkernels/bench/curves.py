@@ -204,7 +204,13 @@ def _adelie_curve(problem, sweep: Sequence[int]) -> list[tuple[float, float]]:
             except Exception:  # noqa: BLE001
                 continue
             wall = time.perf_counter() - t0
-            x = np.asarray(state.betas[-1].toarray()).squeeze()
+            # betas is a (n_lambda, n) scipy sparse matrix; negative-indexing a
+            # sparse matrix raises, so densify first. At a low iteration cap
+            # grpnet may return zero rows (didn't finish lambda 0) — skip those.
+            betas = np.asarray(state.betas.toarray())
+            if betas.shape != (1, problem.n):
+                continue
+            x = betas[-1]
             pts.append((wall, trusted_kkt(problem, x)))
     pts.sort(key=lambda p: p[0])
     return pts
