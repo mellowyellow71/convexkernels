@@ -2135,3 +2135,24 @@ feature-*selection* decision, which is tolerant of ~0.5% (8-bit) error. Quantize
 only that check; keep the reduced fp32 solve exact. This is the next experiment
 (run through the loop, branched from the active-set champion, so the fp64 gate
 guarantees the returned iterate is still exact).
+
+## Reframe — hero batch 2 (branch from active-set champion) (2026-06-16)
+
+12 proposals branched from the active-set champion, reps=3, quant redirected to
+the violation-check in program.md. **1 kept / 11 discarded; 0 quantization
+attempts.** Final champion 1.263s = **3.27× Adelie** (+5% over batch-1's
+1.375s, within run-to-run noise; all candidates converged to KKT 7.5e-6 and
+clustered 1.25–1.47s).
+
+**Finding — the active-set frontier is saturated (~1.25s) and the proposer fell
+into a rut.** Every proposal was the *same* micro-edit: "remove the mid-run
+trusted-KKT heartbeat to save a dense pass." That can't actually buy speed (the
+Recorder excludes KKT-eval time from its timestamps by design), so they all
+discarded — the proposer was optimizing the measurement schedule, not the
+algorithm, and never tried a new lever (warm-start, fp16 inner, block-CD) nor
+quantization. Classic low-diversity autoresearch stall. More hero proposals are
+not worth the budget without (a) a program.md change that bans certification-
+schedule edits and forces a new lever each proposal, or (b) moving on.
+
+### Hero scorecard (5-rep confirmed champion is batch-1's, both ~3×)
+- Adelie 4.13s → champion ~1.3s → **~3.2–3.3× faster**, KKT-verified. Goal met.
