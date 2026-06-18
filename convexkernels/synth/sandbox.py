@@ -24,13 +24,13 @@ from typing import Any, Optional
 @dataclass
 class SandboxResult:
     status: str  # completed | timeout | runtime_error | no_result
-    iters: Optional[int] = None
     kkt_final: Optional[float] = None
-    wall_time_s: Optional[float] = None
+    reached_target: Optional[bool] = None
+    time_to_kkt_s: Optional[float] = None
     setup_time_s: Optional[float] = None
     solve_time_s: Optional[float] = None
-    single_solve_time_s: Optional[float] = None
-    converged: Optional[bool] = None
+    n_records: Optional[int] = None
+    trajectory: Optional[list] = None
     error_type: Optional[str] = None
     error_message: Optional[str] = None
     stderr_tail: str = ""
@@ -39,13 +39,13 @@ class SandboxResult:
     def from_dict(cls, d: dict) -> "SandboxResult":
         return cls(
             status=d.get("status", "no_result"),
-            iters=d.get("iters"),
             kkt_final=d.get("kkt_final"),
-            wall_time_s=d.get("wall_time_s"),
+            reached_target=d.get("reached_target"),
+            time_to_kkt_s=d.get("time_to_kkt_s"),
             setup_time_s=d.get("setup_time_s"),
             solve_time_s=d.get("solve_time_s"),
-            single_solve_time_s=d.get("single_solve_time_s"),
-            converged=d.get("converged"),
+            n_records=d.get("n_records"),
+            trajectory=d.get("trajectory"),
             error_type=d.get("error_type"),
             error_message=d.get("error_message"),
             stderr_tail=d.get("traceback", ""),
@@ -69,16 +69,13 @@ def write_eval_config(
     problem: Any,
     *,
     kernel_module: str,
-    kernel_step: str = "fista_step",
-    kernel_init: str = "init_state",
-    variant: str = "basic",
+    kernel_solve: str = "solve",
     problem_backend: str = "native",
     problem_dtype: str = "fp32",
     dtype_strategy: str = "fp32",
     warmup_runs: int = 0,
-    max_iters: int = 200,
-    tol: float = 1e-6,
-    algorithm: str = "fista",
+    kkt_tol: float = 1e-6,
+    max_time_s: float = 60.0,
 ) -> Path:
     """Pickle the problem and write the eval config to `run_dir`."""
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -88,16 +85,13 @@ def write_eval_config(
 
     config = {
         "kernel_module": kernel_module,
-        "kernel_step": kernel_step,
-        "kernel_init": kernel_init,
-        "variant": variant,
+        "kernel_solve": kernel_solve,
         "problem_backend": problem_backend,
         "problem_dtype": problem_dtype,
         "dtype_strategy": dtype_strategy,
         "warmup_runs": warmup_runs,
-        "max_iters": max_iters,
-        "tol": tol,
-        "algorithm": algorithm,
+        "kkt_tol": kkt_tol,
+        "max_time_s": max_time_s,
         "problem_pickle_path": str(problem_path),
     }
     config_path = run_dir / "eval_config.json"

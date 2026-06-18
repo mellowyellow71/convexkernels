@@ -1,27 +1,37 @@
-"""Subprocess entry point for kernel evaluation.
+"""Subprocess entry point for kernel evaluation (algorithm-open contract).
 
 Invoked by `synth/sandbox.py` as:
     python -m convexkernels.synth._eval_kernel <run_dir>
 
-Reads:
-  <run_dir>/eval_config.json   # {kernel_module, kernel_step, kernel_init,
-                                  variant, max_iters, tol, problem_pickle_path}
-  <problem_pickle_path>        # pickled Lasso (or compatible Problem)
+The candidate kernel owns the *entire* solve and chooses its own algorithm. It
+exposes a single entry point:
 
-Writes (on success):
-  <run_dir>/result.json        # {status: 'completed', iters, kkt_final,
-                                  wall_time_s, converged}
-  <run_dir>/x.npy              # final iterate
+    def solve(problem, recorder, *, kkt_tol, max_time_s) -> X
 
-On error: writes <run_dir>/result.json with status != 'completed' and stderr-style detail.
+and (optionally) `prepare_problem(problem[, config])` for one-time setup
+(Gram precompute, device upload, ...). The harness:
+
+  1. times setup (`_prepare_problem` + the candidate's `prepare_problem`),
+  2. builds a `Recorder` bound to the *trusted* numpy frontend problem so the
+     KKT metric cannot be faked,
+  3. runs `solve(...)`,
+  4. independently recomputes the trusted KKT on the returned iterate (the
+     final anti-gaming gate),
+  5. writes `result.json` with `time_to_kkt_s`, `kkt_final`, `reached_target`,
+     the setup/solve split, and the full `(t, kkt)` trajectory.
+
+There is no fixed-driver dispatch any more — algorithm choice is part of the
+search space.
 """
 
 from __future__ import annotations
 
+import functools
 import importlib
 import importlib.util
 import inspect
 import json
+import math
 import pickle
 import sys
 import traceback
@@ -29,6 +39,9 @@ from pathlib import Path
 from time import perf_counter
 
 import numpy as np
+
+from convexkernels.bench.metrics import trusted_kkt
+from convexkernels.synth.recorder import Recorder
 
 
 def _load_kernel_module(spec: str):
@@ -68,10 +81,7 @@ def _prepare_problem(prob, config: dict):
     )
 
     dtype_name = config.get("problem_dtype", "fp32")
-    dtype = {
-        "fp32": mx.float32,
-        "fp16": mx.float16,
-    }[dtype_name]
+    dtype = {"fp32": mx.float32, "fp16": mx.float16}[dtype_name]
     if isinstance(prob, NonnegativeLasso):
         return NonnegativeLassoMLX.from_problem(prob, dtype=dtype)
     if isinstance(prob, TVDenoising1D):
@@ -87,6 +97,15 @@ def _prepare_problem(prob, config: dict):
     return LassoMLX.from_lasso(prob, dtype=dtype)
 
 
+def _call_prepare(kernel_module, prob, config):
+    if not hasattr(kernel_module, "prepare_problem"):
+        return prob
+    fn = kernel_module.prepare_problem
+    if len(inspect.signature(fn).parameters) >= 2:
+        return fn(prob, config)
+    return fn(prob)
+
+
 def main(run_dir: str) -> int:
     run_path = Path(run_dir)
     config_path = run_path / "eval_config.json"
@@ -95,98 +114,71 @@ def main(run_dir: str) -> int:
     try:
         config = json.loads(config_path.read_text())
         with open(config["problem_pickle_path"], "rb") as f:
-            prob = pickle.load(f)
+            trusted_problem = pickle.load(f)  # canonical numpy frontend problem
+
+        kkt_tol = float(config.get("kkt_tol", config.get("tol", 1e-6)))
+        max_time_s = float(config.get("max_time_s", 60.0))
+        solve_name = config.get("kernel_solve", "solve")
+
+        # ---- warm the accelerator before timing setup ----
+        # The first mx.eval in a fresh subprocess pays a fixed ~1.5-2s Metal
+        # context cold-init. That is a per-process artifact, identical for every
+        # candidate and NOT paid by the in-process cvxpy baselines, so charging
+        # it to a candidate's setup would dwarf the real algorithmic setup
+        # (data upload, Gram precompute) on small/medium shapes. Force context
+        # init here so the timed setup measures solver work, not device boot.
+        if config.get("problem_backend") == "mlx":
+            try:
+                import mlx.core as mx  # type: ignore
+
+                mx.eval(mx.array([0.0]) + 1.0)
+            except Exception:
+                pass
+
+        # ---- setup (timed) ----
         setup_t0 = perf_counter()
         kernel_module = _load_kernel_module(config["kernel_module"])
-        prob = _prepare_problem(prob, config)
-        if hasattr(kernel_module, "prepare_problem"):
-            prepare_problem = kernel_module.prepare_problem
-            if len(inspect.signature(prepare_problem).parameters) >= 2:
-                prob = prepare_problem(prob, config)
-            else:
-                prob = prepare_problem(prob)
+        prob = _prepare_problem(trusted_problem, config)
+        prob = _call_prepare(kernel_module, prob, config)
         setup_time_s = perf_counter() - setup_t0
 
-        kernel_step = getattr(kernel_module, config["kernel_step"])
-        kernel_init = getattr(kernel_module, config["kernel_init"])
+        solve = getattr(kernel_module, solve_name)
+        kkt_fn = functools.partial(trusted_kkt, trusted_problem)
 
-        algorithm = config.get("algorithm", "fista")
-        # Record history (= trajectory of KKT or gap) for the final timed run
-        # so the proposer can see *where* convergence stalled or diverged.
-        # convergence_check_every reduces per-iter GPU sync overhead from
-        # checking the convergence criterion every iteration; defaults to 10
-        # for sandbox runs, can be overridden via eval_config.
-        algo_kwargs = {
-            "max_iters": config.get("max_iters", 200),
-            "tol": config.get("tol", 1e-6),
-            "variant": config.get("variant", "basic"),
-            "kernel_step": kernel_step,
-            "kernel_init": kernel_init,
-            "record_history": True,
-            "convergence_check_every": int(config.get("convergence_check_every", 10)),
-        }
-        if algorithm == "fista":
-            from convexkernels.algorithms.fista import fista as _driver
-            fitness_attr = "kkt_final"
-        elif algorithm == "pdhg":
-            from convexkernels.algorithms.pdhg import pdhg as _driver
-            fitness_attr = "gap_final"
-        elif algorithm == "alm":
-            from convexkernels.algorithms.alm import alm as _driver
-            fitness_attr = "primal_res_final"
-        elif algorithm == "admm":
-            from convexkernels.algorithms.admm import admm as _driver
-            fitness_attr = "primal_res_final"
-        elif algorithm in ("fista_path", "fista_gram"):
-            from convexkernels.algorithms.fista_path import fista_path as _driver
-            fitness_attr = "kkt_max_final"
-            # fista_path driver doesn't accept a `variant` kwarg (only "basic"
-            # is supported in v0; restart is per-column inside the seed kernel).
-            algo_kwargs.pop("variant", None)
-            # Plug in the kernel's on-device KKT-max function so we don't
-            # force a per-check host transfer of (n, K) iterates.
-            if hasattr(kernel_module, "kkt_max"):
-                algo_kwargs["kernel_kkt_max"] = kernel_module.kkt_max
-        else:
-            raise ValueError(
-                f"unknown algorithm {algorithm!r}; expected "
-                f"fista, pdhg, alm, admm, fista_path, or fista_gram"
-            )
+        # ---- warmups (discarded) ----
+        for _ in range(int(config.get("warmup_runs", 0))):
+            w = Recorder(kkt_fn, max_time_s=max_time_s)
+            solve(prob, w, kkt_tol=kkt_tol, max_time_s=max_time_s)
 
-        for _ in range(config.get("warmup_runs", 0)):
-            _driver(prob, **algo_kwargs)
+        # ---- timed solve ----
+        rec = Recorder(kkt_fn, max_time_s=max_time_s)
+        solve_t0 = perf_counter()
+        X = solve(prob, rec, kkt_tol=kkt_tol, max_time_s=max_time_s)
+        solve_time_s = perf_counter() - solve_t0
 
-        res = _driver(prob, **algo_kwargs)
-        solve_time_s = float(res.wall_time_s)
-        single_solve_time_s = float(setup_time_s + solve_time_s)
+        # ---- trusted final verification (anti-gaming gate) ----
+        X_host = Recorder._materialize(X)
+        kkt_final = trusted_kkt(trusted_problem, X_host)
+        np.save(run_path / "x.npy", X_host)
 
-        np.save(run_path / "x.npy", np.asarray(res.x))
+        trajectory = [[float(t), float(k)] for (t, k) in rec.trajectory]
+        (run_path / "trajectory.json").write_text(json.dumps(trajectory))
 
-        # Compress the per-iter fitness trajectory and write alongside the
-        # result so the synth loop's proposer-context builder can read it
-        # cheaply. The full history can be huge (thousands of iters); only
-        # the compressed series goes to the LLM prompt.
-        history = getattr(res, "history", {}) or {}
-        traj_key = {"fista": "kkt", "pdhg": "gap", "alm": "primal_res", "admm": "primal_res"}.get(algorithm, "kkt")
-        traj = list(history.get(traj_key, []))
-        if traj:
-            (run_path / "trajectory.json").write_text(json.dumps(traj))
+        reached = bool(kkt_final <= kkt_tol)
+        ttk = rec.time_to_kkt(kkt_tol)
+        if reached and not math.isfinite(ttk):
+            # converged at the final iterate but never sampled below tol
+            ttk = solve_time_s
 
-        # KKT/gap reported as kkt_final regardless of algorithm so the synth
-        # loop's gating logic stays uniform. Algorithms that produce a primal-
-        # dual gap rather than a KKT residual write it to the same field;
-        # acceptance gates apply identically.
-        fitness_value = float(getattr(res, fitness_attr))
         result = {
             "status": "completed",
-            "iters": int(res.n_iters),
-            "kkt_final": fitness_value,
-            "fitness_kind": "gap" if algorithm == "pdhg" else "kkt",
-            "wall_time_s": single_solve_time_s,
+            "kkt_final": kkt_final,
+            "reached_target": reached,
+            "time_to_kkt_s": (ttk if math.isfinite(ttk) else None),
             "setup_time_s": float(setup_time_s),
-            "solve_time_s": solve_time_s,
-            "single_solve_time_s": single_solve_time_s,
-            "converged": bool(res.converged),
+            "solve_time_s": float(solve_time_s),
+            "n_records": int(rec.n_records),
+            "trajectory": trajectory,
         }
         result_path.write_text(json.dumps(result))
         return 0

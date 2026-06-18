@@ -1,24 +1,21 @@
-"""Karpathy-style autoresearch driver for KKT/gap-gated kernel synthesis.
+"""Autoresearch driver: KKT-verified time-to-target, open algorithm search.
 
 The job of this loop:
-  1. Detect orphans from prior crashes (write-ahead `started.json`).
-  2. Measure the current seed / persisted champion under multi-rep timing.
+  1. Measure the baseline panel (classical solvers) → the bar to beat, as
+     each solver's time to reach the trusted KKT target.
+  2. Measure the seed (or a resumed checkpoint) under the same ruler.
   3. For each proposal:
-     - Build a rich context (current source, fitness trajectory, history with
-       rationales, target metric, hard gate) and ask the proposer for a full-
-       source rewrite.
+     - Build a bounded context from the curated research state (rebuilt from
+       the durable experiment tree, never from raw chat history) plus the
+       current checkpoint's source, and ask the proposer for a full-source
+       `solve()` rewrite. Algorithm choice is part of the search space.
      - Materialize the candidate, eval in the subprocess sandbox.
-     - Gate: converged AND fitness < tol AND solve_ms < best * margin.
-     - Append a lineage row, promote champion if kept.
+     - Score: reached target AND total_time_s < champion * margin.
+     - Append a lineage row (linked to its parent checkpoint → experiment
+       tree). If kept, write a durable checkpoint and advance the champion.
 
-Algorithm-agnostic: dispatches to `fista` or `pdhg` via the `algorithm` field
-on the eval config. Fitness is `kkt` for FISTA, `gap` for PDHG; both stored
-in the same `fitness_final` field so the gating logic stays uniform.
-
-Intentionally absent (per the 2026-05-10 pivot): structured edit grammar,
-edit priors, fitness diagnostics, slot-keyed champion store with symlinks,
-tier-3 evaluator, transfer seeds. Those proved to be observation-only
-machinery that didn't steer behavior. The signal channel is what matters.
+The single optimality ruler is `bench.metrics.trusted_kkt`, computed by the
+harness on every iterate — candidate and baseline alike.
 """
 
 from __future__ import annotations
@@ -28,17 +25,18 @@ import importlib.util
 import json
 import platform
 import statistics
-import time
 import uuid
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional, Protocol
 
-from .checkpoint import find_orphans, mark_started
+from ..bench.curves import baseline_panel, problem_hash, time_to_kkt
+from .checkpoints import CheckpointStore
 from .lineage import Edit as _LineageEdit
 from .lineage import Slot
-from .sandbox import SandboxResult, run_kernel, write_eval_config
+from .research_state import build_research_state, write_research_state
+from .sandbox import run_kernel, write_eval_config
 
 
 # ---------- types ----------
@@ -46,11 +44,6 @@ from .sandbox import SandboxResult, run_kernel, write_eval_config
 
 @dataclass
 class Edit:
-    """Slim Edit for the new loop. Mostly a full-source rewrite from the LLM.
-
-    Adapted to the legacy `lineage.Edit` schema for `mark_started` compatibility
-    via `_to_lineage_edit`.
-    """
     type: str
     rationale: str
     full_source: str = ""
@@ -70,17 +63,13 @@ class Edit:
 
 @dataclass
 class EvalScore:
-    converged: bool
-    fitness_final: float           # KKT (FISTA) or primal-dual gap (PDHG)
-    fitness_kind: str              # "kkt" | "gap"
-    iters: int
-    solve_ms_median: float
-    solve_ms_min: float
-    solve_ms_max: float
-    solve_ms_std: float
-    setup_ms_median: float = 0.0
-    fitness_trajectory: list[float] = field(default_factory=list)  # compressed
+    reached_target: bool
+    kkt_final: float
+    time_to_kkt_s: float       # median over reps (solve-only; inf if not reached)
+    total_time_s: float        # median (setup + time_to_kkt); cold-start bar
+    setup_s: float
     n_reps: int = 1
+    trajectory: list = field(default_factory=list)  # representative rep (t, kkt)
 
 
 @dataclass
@@ -142,103 +131,40 @@ def _slot_to_dict(slot: Slot) -> dict:
     }
 
 
-def _edit_to_dict(edit: Edit) -> dict:
-    d = asdict(edit)
-    if d["full_source"]:
-        d["source_bytes"] = len(d["full_source"])
-        d["full_source"] = d["full_source"][:0]  # don't repeat in lineage
-    return d
-
-
 def _append_jsonl(path: Path, row: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a") as f:
         f.write(json.dumps(row, default=str) + "\n")
 
 
-def _load_slot_history(lineage_path: Path, slot: Slot, *, last: int) -> list[dict]:
-    if not lineage_path.exists():
-        return []
-    rows: list[dict] = []
-    for line in lineage_path.read_text().splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            row = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        rs = row.get("slot") or {}
-        if (
-            rs.get("problem_family") == slot.problem_family
-            and rs.get("algorithm") == slot.algorithm
-            and rs.get("hardware") == slot.hardware
-            and rs.get("dtype") == slot.dtype
-        ):
-            rows.append(row)
-    return rows[-last:]
-
-
-def _compress_trajectory(traj: list[float]) -> list[float]:
-    """Down-sample a trajectory to ~9 anchor points: start, quartiles, end,
-    plus the iteration of the largest decrease and the largest non-decrease.
-    Keeps the prompt small while preserving stall/divergence signal."""
-    if not traj:
-        return []
-    n = len(traj)
-    if n <= 9:
-        return [float(v) for v in traj]
-    quartile_idx = [0, n // 4, n // 2, 3 * n // 4, n - 1]
-    diffs = [traj[k + 1] - traj[k] for k in range(n - 1)]
-    if diffs:
-        worst = int(max(range(len(diffs)), key=lambda k: diffs[k]))
-        best = int(min(range(len(diffs)), key=lambda k: diffs[k]))
-        idx = sorted(set(quartile_idx + [worst, best, max(0, worst - 1), min(n - 1, best + 1)]))
-    else:
-        idx = quartile_idx
-    return [float(traj[i]) for i in idx]
+def _median(values: list[float]) -> float:
+    return float(statistics.median(values)) if values else float("inf")
 
 
 # ---------- evaluation ----------
-
-
-def _stats(values: list[float]) -> dict:
-    if not values:
-        return {"median": 0.0, "min": 0.0, "max": 0.0, "std": 0.0}
-    return {
-        "median": float(statistics.median(values)),
-        "min": float(min(values)),
-        "max": float(max(values)),
-        "std": float(statistics.stdev(values)) if len(values) > 1 else 0.0,
-    }
 
 
 def _evaluate(
     *,
     problem: Any,
     kernel_module_spec: str,
-    kernel_step: str,
-    kernel_init: str,
-    algorithm: str,
     run_dir: Path,
-    max_iters: int,
-    tol: float,
+    kkt_tol: float,
+    max_time_s: float,
     reps: int,
-    variant: str,
     problem_backend: str,
     problem_dtype: str,
-    cost_model: str,
+    dtype_strategy: str,
     warmup_runs: int,
     timeout_s: float,
 ) -> tuple[Optional[EvalScore], Optional[str]]:
-    """Run the kernel `reps` times and aggregate. Returns (score, error)."""
+    """Run the candidate `reps` times and aggregate time-to-target."""
     run_dir.mkdir(parents=True, exist_ok=True)
-    solve_times_ms: list[float] = []
-    setup_times_ms: list[float] = []
-    iters: list[int] = []
-    fitness: list[float] = []
-    last_traj: list[float] = []
-    last_converged = True
+    times: list[float] = []
+    setups: list[float] = []
+    kkts: list[float] = []
+    reached_all = True
+    last_traj: list = []
 
     for rep in range(max(1, reps)):
         rep_dir = run_dir / (f"rep_{rep}" if reps > 1 else "")
@@ -247,56 +173,36 @@ def _evaluate(
             rep_dir,
             problem,
             kernel_module=kernel_module_spec,
-            kernel_step=kernel_step,
-            kernel_init=kernel_init,
-            variant=variant,
+            kernel_solve="solve",
             problem_backend=problem_backend,
             problem_dtype=problem_dtype,
+            dtype_strategy=dtype_strategy,
             warmup_runs=warmup_runs,
-            max_iters=max_iters,
-            tol=tol,
-            algorithm=algorithm,
+            kkt_tol=kkt_tol,
+            max_time_s=max_time_s,
         )
         result = run_kernel(rep_dir, timeout_s=timeout_s)
         if result.status != "completed":
             return None, f"{result.status}:{(result.error_type or '')}:{(result.error_message or '')[:200]}"
-        # Cost-model gate: under "single", the candidate is timed including
-        # subprocess `prepare_problem` + driver wall_time; under "amortized",
-        # only the driver's repeated-solve wall_time. This blocks stuffing
-        # arbitrary work into prepare_problem to game the speedup gate.
-        if cost_model == "amortized":
-            timed_ms = (result.solve_time_s or 0.0) * 1000.0
-        else:
-            timed_ms = (result.single_solve_time_s
-                        or ((result.setup_time_s or 0.0) + (result.solve_time_s or 0.0))) * 1000.0
-        solve_times_ms.append(timed_ms)
-        setup_times_ms.append((result.setup_time_s or 0.0) * 1000.0)
-        iters.append(int(result.iters or 0))
-        fitness.append(float(result.kkt_final or 0.0))
-        last_converged = bool(result.converged)
-        # Trajectory persisted alongside the result, if we extended the eval to write it.
-        traj_path = rep_dir / "trajectory.json"
-        if traj_path.exists():
-            try:
-                last_traj = list(json.loads(traj_path.read_text()))
-            except json.JSONDecodeError:
-                last_traj = []
+        reached_all = reached_all and bool(result.reached_target)
+        kkts.append(float(result.kkt_final if result.kkt_final is not None else float("inf")))
+        setups.append(float(result.setup_time_s or 0.0))
+        ttk = result.time_to_kkt_s
+        times.append(float(ttk) if ttk is not None else float("inf"))
+        if result.trajectory:
+            last_traj = result.trajectory
 
-    s_solve = _stats(solve_times_ms)
-    s_setup = _stats(setup_times_ms)
-    fitness_kind = "gap" if algorithm == "pdhg" else "kkt"
+    time_med = _median(times)
+    setup_med = _median(setups)
+    total = setup_med + time_med  # inf-safe: inf + finite = inf
     score = EvalScore(
-        converged=last_converged,
-        fitness_final=float(statistics.median(fitness)) if fitness else 0.0,
-        fitness_kind=fitness_kind,
-        iters=int(statistics.median(iters)) if iters else 0,
-        solve_ms_median=s_solve["median"],
-        solve_ms_min=s_solve["min"],
-        solve_ms_max=s_solve["max"],
-        solve_ms_std=s_solve["std"],
-        setup_ms_median=s_setup["median"],
-        fitness_trajectory=_compress_trajectory(last_traj),
-        n_reps=len(solve_times_ms),
+        reached_target=reached_all,
+        kkt_final=_median(kkts),
+        time_to_kkt_s=time_med,
+        total_time_s=total,
+        setup_s=setup_med,
+        n_reps=len(times),
+        trajectory=last_traj,
     )
     return score, None
 
@@ -307,38 +213,25 @@ def _evaluate(
 def _decide(
     cand: EvalScore,
     best: EvalScore,
-    fitness_tol: float,
-    speedup_margin: float,
+    kkt_tol: float,
+    margin: float,
+    best_baseline: tuple[Optional[str], float],
 ) -> tuple[bool, str]:
-    if not cand.converged:
-        return False, f"discard:not_converged"
-    if cand.fitness_final >= fitness_tol:
-        return False, f"discard:{cand.fitness_kind}_above_tol"
-    if cand.solve_ms_median >= best.solve_ms_median * speedup_margin:
-        return False, "discard:not_faster_than_baseline"
-    return True, "keep:passed"
+    if not cand.reached_target or cand.kkt_final > kkt_tol:
+        return False, "discard:did_not_reach_target"
+    bl_name, bl_time = best_baseline
+    bl_tag = ""
+    if bl_name is not None and cand.total_time_s > 0:
+        bl_tag = f";vs_best_baseline={bl_name}({bl_time / cand.total_time_s:.2f}x)"
+    if best.total_time_s == float("inf") or not best.reached_target:
+        return True, f"keep:first_valid_champion{bl_tag}"
+    if cand.total_time_s >= best.total_time_s * margin:
+        return False, f"discard:not_faster_than_champion{bl_tag}"
+    ratio = cand.total_time_s / best.total_time_s if best.total_time_s else 0.0
+    return True, f"keep:beats_champion({ratio:.2f}x){bl_tag}"
 
 
 # ---------- proposal context ----------
-
-
-def _compact_history_for_prompt(history: list[dict], last: int = 10) -> list[dict]:
-    out: list[dict] = []
-    for row in history[-last:]:
-        compact = {
-            "id": row.get("id", "")[:8],
-            "edit_type": (row.get("edit") or {}).get("type"),
-            "edit_rationale": (row.get("edit") or {}).get("rationale", "")[:200],
-            "decision": (row.get("decision") or {}).get("reason"),
-        }
-        s = row.get("score") or {}
-        if s:
-            compact["fitness"] = s.get("fitness_final")
-            compact["fitness_kind"] = s.get("fitness_kind")
-            compact["solve_ms"] = s.get("solve_ms_median")
-            compact["iters"] = s.get("iters")
-        out.append(compact)
-    return out
 
 
 def _build_proposal_ctx(
@@ -346,11 +239,9 @@ def _build_proposal_ctx(
     slot: Slot,
     current_source_path: Optional[Path],
     current_score: EvalScore,
-    history: list[dict],
-    algorithm: str,
-    fitness_tol: float,
-    speedup_margin: float,
-    cost_model: str,
+    research_state: dict,
+    kkt_tol: float,
+    margin: float,
     program_md: str,
 ) -> dict:
     src = ""
@@ -358,16 +249,13 @@ def _build_proposal_ctx(
         src = current_source_path.read_text(errors="replace")
     return {
         "slot": _slot_to_dict(slot),
-        "algorithm": algorithm,
-        "fitness_kind": "gap" if algorithm == "pdhg" else "kkt",
-        "fitness_tol": fitness_tol,
-        "speedup_margin": speedup_margin,
-        "cost_model": cost_model,
+        "kkt_tol": kkt_tol,
+        "margin": margin,
         "program_md": program_md,
         "current_source": src,
         "current_source_path": str(current_source_path) if current_source_path else None,
         "current_score": asdict(current_score),
-        "history": _compact_history_for_prompt(history, last=10),
+        "research_state": research_state,
     }
 
 
@@ -382,140 +270,201 @@ def run_synth_loop(
     slot: Slot,
     state_root: Path,
     n_proposals: int = 50,
-    algorithm: str = "fista",
-    variant: str = "basic",
-    fitness_tol: float = 1e-6,
-    max_iters: int = 5000,
-    reps: int = 5,
-    speedup_margin: float = 0.97,
-    problem_backend: str = "native",
+    kkt_tol: float = 1e-6,
+    max_time_s: float = 60.0,
+    reps: int = 3,
+    margin: float = 0.97,
+    problem_backend: str = "mlx",
     problem_dtype: str = "fp32",
-    cost_model: str = "single",
+    dtype_strategy: str = "fp32",
     warmup_runs: int = 1,
-    timeout_s: float = 60.0,
+    timeout_s: float = 120.0,
     program_md: str = "",
+    resume_from: Optional[str] = None,
+    compute_baselines: bool = True,
+    baseline_solvers: tuple[str, ...] = (
+        "CLARABEL", "SCS", "OSQP", "ECOS", "sklearn", "adelie",
+    ),
+    extra_baseline_curves: Optional[dict] = None,
     verbose: bool = False,
 ) -> list[LineageRow]:
-    """Run a full Karpathy-style autoresearch session.
-
-    Returns the lineage rows appended this session (excluding the baseline).
-    All durable state lives under `state_root`:
+    """Run a full autoresearch session. Durable state under `state_root`:
         runs/                 per-proposal artifacts
-        lineage.jsonl         append-only experiment log
-        program.md            (caller-managed) instruction layer
-
-    The loop is single-threaded by design — Mac MLX can't share a GPU
-    cleanly across processes. Cluster parallelism is one slot per node.
+        checkpoints/<id>/     durable champion nodes (the experiment tree)
+        baselines/<hash>/     cached baseline KKT-vs-time curves
+        lineage.jsonl         append-only experiment log (with parent_id)
+        research_state.json   curated state rebuilt from the tree each iter
     """
     state_root = Path(state_root)
     runs_root = state_root / "runs"
     lineage_path = state_root / "lineage.jsonl"
     runs_root.mkdir(parents=True, exist_ok=True)
+    store = CheckpointStore(state_root)
+    phash = problem_hash(problem)
 
-    orphans = find_orphans(runs_root, lineage_path)
-    if orphans and verbose:
-        print(f"[synth] {len(orphans)} orphan(s) from prior crash")
+    # ---- baseline panel: the bar to beat ----
+    baseline_times: dict[str, float] = {}
+    panel: dict[str, list] = {}
+    if compute_baselines:
+        try:
+            panel = baseline_panel(
+                problem, solvers=baseline_solvers,
+                cache_dir=state_root / "baselines",
+            )
+        except Exception as exc:  # noqa: BLE001
+            if verbose:
+                print(f"[synth] baseline panel failed: {exc}")
+    # Injected curves (e.g. cached Adelie on the hero shape, where the cvxpy
+    # interior-point panel is intractable). Persist them under the baselines
+    # cache dir so the end-of-run plot overlays them too.
+    if extra_baseline_curves:
+        bdir = state_root / "baselines" / phash
+        bdir.mkdir(parents=True, exist_ok=True)
+        for name, curve in extra_baseline_curves.items():
+            panel[name] = curve
+            (bdir / f"{name}.json").write_text(json.dumps(curve))
+    baseline_times = {
+        name: time_to_kkt(curve, kkt_tol) for name, curve in panel.items()
+    }
+    best_baseline = (None, float("inf"))
+    if baseline_times:
+        bl = min(baseline_times.items(), key=lambda kv: kv[1])
+        best_baseline = bl
+    if verbose:
+        print(f"[synth] baselines time_to_kkt: {baseline_times}")
 
-    history = _load_slot_history(lineage_path, slot, last=20)
+    # ---- resolve the starting point (resume checkpoint or seed) ----
+    parent_id: Optional[str] = None
+    if resume_from is not None:
+        ck = store.get(resume_from)
+        if ck is None:
+            raise RuntimeError(f"resume checkpoint not found: {resume_from}")
+        current_source_path: Optional[Path] = ck.source_path
+        current_kernel_module = str(ck.source_path)
+        parent_id = ck.id
+        if verbose:
+            print(f"[synth] resuming from checkpoint {ck.id}")
+    else:
+        current_source_path = _resolve_seed_path(seed_kernel)
+        current_kernel_module = seed_kernel["module"]
 
-    # Baseline measurement
-    seed_path = _resolve_seed_path(seed_kernel)
+    # ---- measure the starting champion ----
     base_dir = runs_root / f"_baseline_{_new_id()}"
     base_score, base_err = _evaluate(
         problem=problem,
-        kernel_module_spec=seed_kernel["module"],
-        kernel_step=seed_kernel["step"],
-        kernel_init=seed_kernel["init"],
-        algorithm=algorithm,
+        kernel_module_spec=current_kernel_module,
         run_dir=base_dir,
-        max_iters=max_iters,
-        tol=fitness_tol,
+        kkt_tol=kkt_tol,
+        max_time_s=max_time_s,
         reps=reps,
-        variant=variant,
         problem_backend=problem_backend,
         problem_dtype=problem_dtype,
-        cost_model=cost_model,
+        dtype_strategy=dtype_strategy,
         warmup_runs=warmup_runs,
         timeout_s=timeout_s,
     )
-    if base_score is None or not base_score.converged or base_score.fitness_final >= fitness_tol:
-        raise RuntimeError(
-            f"baseline did not converge: err={base_err} "
-            f"score={base_score}"
-        )
+    if base_score is None or not base_score.reached_target:
+        raise RuntimeError(f"seed did not reach target: err={base_err} score={base_score}")
     if verbose:
-        print(f"[synth] baseline {base_score.fitness_kind}={base_score.fitness_final:.2e} "
-              f"solve={base_score.solve_ms_median:.1f}±{base_score.solve_ms_std:.1f}ms "
-              f"iters={base_score.iters} (n_reps={reps})")
+        print(f"[synth] seed total={base_score.total_time_s:.3f}s "
+              f"(setup={base_score.setup_s:.3f} + ttk={base_score.time_to_kkt_s:.3f}) "
+              f"kkt={base_score.kkt_final:.2e}")
 
     current_score = base_score
-    current_source_path: Optional[Path] = seed_path
-    current_kernel_module = seed_kernel["module"]
+
+    # Root the experiment tree: the seed itself is a durable checkpoint node.
+    if resume_from is None:
+        seed_src = ""
+        if current_source_path is not None and current_source_path.exists():
+            seed_src = current_source_path.read_text(errors="replace")
+        seed_ck = store.save(
+            id=_new_id(), parent_id=None, source=seed_src,
+            score=asdict(base_score), trajectory=base_score.trajectory,
+            algorithm_tag="seed", problem_hash=phash,
+        )
+        parent_id = seed_ck.id
+
+    history: list[dict] = []
+
+    # One-time analytical bandwidth/AI hint for this problem shape; steers the
+    # open algorithm search toward the bandwidth-favourable gradient form.
+    cost_model_hint: Optional[dict] = None
+    try:
+        from .roofline import roofline_hint
+
+        cost_model_hint = roofline_hint(problem)
+    except Exception as exc:  # noqa: BLE001 — hint is advisory, never fatal
+        if verbose:
+            print(f"[synth] roofline hint unavailable: {exc}")
+
+    def _refresh_state() -> dict:
+        champ = {
+            "source_path": str(current_source_path) if current_source_path else None,
+            "total_time_s": current_score.total_time_s,
+            "time_to_kkt_s": current_score.time_to_kkt_s,
+            "kkt_final": current_score.kkt_final,
+        }
+        state = build_research_state(
+            lineage_rows=history,
+            baseline_times=baseline_times,
+            champion=champ,
+            kkt_tol=kkt_tol,
+            cost_model=cost_model_hint,
+        )
+        write_research_state(state_root / "research_state.json", state)
+        return state
 
     appended: list[LineageRow] = []
     for i in range(n_proposals):
+        research_state = _refresh_state()
         ctx = _build_proposal_ctx(
             slot=slot,
             current_source_path=current_source_path,
             current_score=current_score,
-            history=history,
-            algorithm=algorithm,
-            fitness_tol=fitness_tol,
-            speedup_margin=speedup_margin,
-            cost_model=cost_model,
+            research_state=research_state,
+            kkt_tol=kkt_tol,
+            margin=margin,
             program_md=program_md,
         )
 
-        # Ask proposer
+        def _record(row: LineageRow) -> None:
+            history.append(asdict(row))
+            appended.append(row)
+            _append_jsonl(lineage_path, asdict(row))
+
         try:
             edit = proposer.propose(ctx)
         except Exception as exc:  # noqa: BLE001
-            row = LineageRow(
-                id=_new_id(), parent_id=None, generation=len(appended) + 1,
+            _record(LineageRow(
+                id=_new_id(), parent_id=parent_id, generation=len(appended) + 1,
                 created_at=_now_iso(), slot=_slot_to_dict(slot),
                 edit={"type": "n/a", "rationale": "", "proposer_role": "impl"},
-                source={"path": "", "hash": ""},
-                score=None,
+                source={"path": "", "hash": ""}, score=None,
                 decision={"accepted": False, "reason": f"crash:proposer_error:{type(exc).__name__}"},
-            )
-            history.append(asdict(row))
-            appended.append(row)
-            _append_jsonl(lineage_path, asdict(row))
+            ))
             if verbose:
-                print(f"[synth] proposal {i+1}/{n_proposals}: proposer crash: {exc}")
+                print(f"[synth] {i+1}/{n_proposals}: proposer crash: {exc}")
             continue
 
         if not edit.full_source.strip():
-            row = LineageRow(
-                id=_new_id(), parent_id=None, generation=len(appended) + 1,
+            _record(LineageRow(
+                id=_new_id(), parent_id=parent_id, generation=len(appended) + 1,
                 created_at=_now_iso(), slot=_slot_to_dict(slot),
                 edit={"type": edit.type, "rationale": edit.rationale, "proposer_role": edit.proposer_role},
-                source={"path": "", "hash": ""},
-                score=None,
+                source={"path": "", "hash": ""}, score=None,
                 decision={"accepted": False, "reason": "discard:empty_source"},
-            )
-            history.append(asdict(row))
-            appended.append(row)
-            _append_jsonl(lineage_path, asdict(row))
-            if verbose:
-                print(f"[synth] proposal {i+1}/{n_proposals}: empty source")
+            ))
             continue
 
         source_hash = _hash(edit.full_source)
         if any((row.get("source") or {}).get("hash") == source_hash for row in history):
-            row = LineageRow(
-                id=_new_id(), parent_id=None, generation=len(appended) + 1,
+            _record(LineageRow(
+                id=_new_id(), parent_id=parent_id, generation=len(appended) + 1,
                 created_at=_now_iso(), slot=_slot_to_dict(slot),
                 edit={"type": edit.type, "rationale": edit.rationale, "proposer_role": edit.proposer_role},
-                source={"path": "", "hash": source_hash},
-                score=None,
+                source={"path": "", "hash": source_hash}, score=None,
                 decision={"accepted": False, "reason": "discard:duplicate_source"},
-            )
-            history.append(asdict(row))
-            appended.append(row)
-            _append_jsonl(lineage_path, asdict(row))
-            if verbose:
-                print(f"[synth] proposal {i+1}/{n_proposals}: duplicate source")
+            ))
             continue
 
         run_id = _new_id()
@@ -524,74 +473,71 @@ def run_synth_loop(
         candidate_path = run_dir / "source.py"
         candidate_path.write_text(edit.full_source)
 
-        mark_started(
-            run_dir,
-            slot,
-            edit._to_lineage_edit(),
-            source_path=str(candidate_path),
-        )
-
         cand_score, cand_err = _evaluate(
             problem=problem,
             kernel_module_spec=str(candidate_path),
-            kernel_step=seed_kernel["step"],
-            kernel_init=seed_kernel["init"],
-            algorithm=algorithm,
             run_dir=run_dir,
-            max_iters=max_iters,
-            tol=fitness_tol,
+            kkt_tol=kkt_tol,
+            max_time_s=max_time_s,
             reps=reps,
-            variant=variant,
             problem_backend=problem_backend,
             problem_dtype=problem_dtype,
-            cost_model=cost_model,
+            dtype_strategy=dtype_strategy,
             warmup_runs=warmup_runs,
             timeout_s=timeout_s,
         )
 
         if cand_score is None:
-            row = LineageRow(
-                id=run_id, parent_id=None, generation=len(appended) + 1,
+            _record(LineageRow(
+                id=run_id, parent_id=parent_id, generation=len(appended) + 1,
                 created_at=_now_iso(), slot=_slot_to_dict(slot),
                 edit={"type": edit.type, "rationale": edit.rationale, "proposer_role": edit.proposer_role},
-                source={"path": str(candidate_path), "hash": source_hash},
-                score=None,
+                source={"path": str(candidate_path), "hash": source_hash}, score=None,
                 decision={"accepted": False, "reason": f"crash:{cand_err}"},
-            )
-            history.append(asdict(row))
-            appended.append(row)
-            _append_jsonl(lineage_path, asdict(row))
+            ))
             if verbose:
-                print(f"[synth] proposal {i+1}/{n_proposals}: crash {cand_err}")
+                print(f"[synth] {i+1}/{n_proposals}: crash {cand_err}")
             continue
 
-        kept, reason = _decide(cand_score, current_score, fitness_tol, speedup_margin)
+        kept, reason = _decide(cand_score, current_score, kkt_tol, margin, best_baseline)
         row = LineageRow(
-            id=run_id, parent_id=None, generation=len(appended) + 1,
+            id=run_id, parent_id=parent_id, generation=len(appended) + 1,
             created_at=_now_iso(), slot=_slot_to_dict(slot),
             edit={"type": edit.type, "rationale": edit.rationale, "proposer_role": edit.proposer_role},
             source={"path": str(candidate_path), "hash": source_hash},
             score=asdict(cand_score),
             decision={"accepted": kept, "reason": reason},
         )
-        history.append(asdict(row))
-        appended.append(row)
-        _append_jsonl(lineage_path, asdict(row))
+        _record(row)
 
         if verbose:
-            tag = "KEEP" if kept else f"discard ({reason.split(':',1)[-1]})"
-            print(
-                f"[synth] proposal {i+1}/{n_proposals}: {tag} "
-                f"{cand_score.fitness_kind}={cand_score.fitness_final:.2e} "
-                f"solve={cand_score.solve_ms_median:.1f}±{cand_score.solve_ms_std:.1f}ms "
-                f"iters={cand_score.iters}"
-            )
+            tag = "KEEP" if kept else f"discard ({reason.split(':', 1)[-1]})"
+            print(f"[synth] {i+1}/{n_proposals}: {tag} "
+                  f"total={cand_score.total_time_s:.3f}s kkt={cand_score.kkt_final:.2e}")
 
         if kept:
+            store.save(
+                id=run_id, parent_id=parent_id,
+                source=edit.full_source,
+                score=asdict(cand_score),
+                trajectory=cand_score.trajectory,
+                algorithm_tag=edit.type,
+                problem_hash=phash,
+            )
             current_source_path = candidate_path
             current_kernel_module = str(candidate_path)
             current_score = cand_score
-            (state_root / "champion.py").unlink(missing_ok=True)
-            (state_root / "champion.py").write_text(edit.full_source)
+            parent_id = run_id  # subsequent proposals branch from the new node
+
+    _refresh_state()
+
+    # Best-effort plot of the final champion vs the baseline panel.
+    try:
+        from ..bench.plotting import plot_state_root
+
+        plot_state_root(state_root, problem, kkt_tol=kkt_tol)
+    except Exception as exc:  # noqa: BLE001
+        if verbose:
+            print(f"[synth] plot failed: {exc}")
 
     return appended

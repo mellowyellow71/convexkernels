@@ -51,11 +51,10 @@ def test_sandbox_completes_end_to_end(tmp_path: Path, tiny_lasso: Lasso) -> None
     write_eval_config(
         run_dir,
         tiny_lasso,
-        kernel_module="convexkernels.kernels.numpy_ref",
-        kernel_step="fista_step",
-        kernel_init="init_state",
-        max_iters=2000,
-        tol=1e-6,
+        kernel_module="convexkernels.kernels.numpy_solve_ref",
+        problem_backend="native",
+        kkt_tol=1e-6,
+        max_time_s=30.0,
     )
     result = run_kernel(run_dir, timeout_s=30.0)
 
@@ -63,9 +62,9 @@ def test_sandbox_completes_end_to_end(tmp_path: Path, tiny_lasso: Lasso) -> None
         f"sandbox failed: {result.status} / {result.error_message} / "
         f"stderr_tail={result.stderr_tail[-500:]}"
     )
-    assert result.converged
+    assert result.reached_target is True
     assert result.kkt_final < 1e-6
-    assert result.iters is not None and result.iters < 2000
+    assert result.time_to_kkt_s is not None and result.time_to_kkt_s >= 0.0
 
     # Compare to in-process FISTA
     res_inproc = fista(tiny_lasso, max_iters=2000, tol=1e-6, variant="basic")
@@ -80,8 +79,7 @@ def test_sandbox_runtime_error_returns_status(tmp_path: Path, tiny_lasso: Lasso)
         run_dir,
         tiny_lasso,
         kernel_module="convexkernels.kernels.does_not_exist",
-        kernel_step="fista_step",
-        kernel_init="init_state",
+        problem_backend="native",
     )
     result = run_kernel(run_dir, timeout_s=10.0)
     assert result.status == "runtime_error"
@@ -110,7 +108,7 @@ def test_sandbox_prepare_problem_hook_records_timing(
     source_path = tmp_path / "prepared_kernel.py"
     source_path.write_text(
         "from pathlib import Path\n"
-        "from convexkernels.kernels.numpy_ref import init_state, fista_step\n\n"
+        "from convexkernels.kernels.numpy_solve_ref import solve\n\n"
         "def prepare_problem(problem, config):\n"
         "    Path(config['problem_pickle_path']).with_name('prepared.txt').write_text(\n"
         "        config.get('dtype_strategy', '')\n"
@@ -122,11 +120,10 @@ def test_sandbox_prepare_problem_hook_records_timing(
         run_dir,
         tiny_lasso,
         kernel_module=str(source_path),
-        kernel_step="fista_step",
-        kernel_init="init_state",
+        problem_backend="native",
         dtype_strategy="mixed_gram",
-        max_iters=2000,
-        tol=1e-6,
+        kkt_tol=1e-6,
+        max_time_s=30.0,
     )
 
     result = run_kernel(run_dir, timeout_s=30.0)
@@ -135,10 +132,6 @@ def test_sandbox_prepare_problem_hook_records_timing(
     assert (run_dir / "prepared.txt").read_text() == "mixed_gram"
     assert result.setup_time_s is not None and result.setup_time_s >= 0.0
     assert result.solve_time_s is not None and result.solve_time_s > 0.0
-    assert result.single_solve_time_s == pytest.approx(
-        result.setup_time_s + result.solve_time_s
-    )
-    assert result.wall_time_s == pytest.approx(result.single_solve_time_s)
 
 
 def test_checkpoint_orphan_detection(tmp_path: Path) -> None:

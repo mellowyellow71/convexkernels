@@ -6,15 +6,12 @@ from pathlib import Path
 
 import pytest
 
-from convexkernels.bench.shapes import ShapeSpec
-from convexkernels.synth import tiers as tiers_mod
 from convexkernels.synth.roofline import (
     dense_fista_bytes_per_iter,
     dense_fista_flops_per_iter,
     estimate_dense_fista_roofline,
     roofline_floor_ms_per_iter,
 )
-from convexkernels.synth.sandbox import SandboxResult
 
 
 def test_dense_fista_roofline_matches_documented_fp32_formula():
@@ -50,48 +47,58 @@ def test_estimate_dense_fista_roofline_from_total_wall_time():
     )
 
 
-def test_run_tier3_records_roofline_metrics(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-):
-    results = [
-        SandboxResult(
-            status="completed",
-            kkt_final=1e-7,
-            wall_time_s=0.002,
-            converged=True,
-            iters=10,
-        )
-    ]
+# --- Gram-path cost model + proposer hint -----------------------------------
 
-    def fake_run_kernel(*args, **kwargs):
-        return results.pop(0)
+import numpy as np  # noqa: E402
 
-    monkeypatch.setattr(tiers_mod, "run_kernel", fake_run_kernel)
+from convexkernels.frontend.lasso import Lasso  # noqa: E402
+from convexkernels.synth.roofline import (  # noqa: E402
+    amortization_crossover_solves,
+    gram_fista_bytes_per_iter,
+    gram_fista_flops_per_iter,
+    gram_setup_flops,
+    roofline_hint,
+)
 
-    spec = ShapeSpec("tiny", m=10, n=20)
-    tier = tiers_mod.run_tier3(
-        run_dir=tmp_path / "tier3",
-        shapes=(spec,),
-        kernel_module="convexkernels.kernels.numpy_ref",
-        config=tiers_mod.EvalConfig(
-            seed_kernel={
-                "module": "convexkernels.kernels.numpy_ref",
-                "step": "fista_step",
-                "init": "init_state",
-            },
-            peak_bandwidth_gb_s=100.0,
-        ),
-        max_iters=100,
-        tol=1e-6,
-        reps=1,
+
+def _lasso(m, n, seed=0):
+    rng = np.random.default_rng(seed)
+    A = rng.standard_normal((m, n))
+    b = rng.standard_normal(m)
+    return Lasso(A, b, 1.0)
+
+
+def test_gram_bytes_flops_and_symmetric_halving():
+    n = 2000
+    assert gram_fista_bytes_per_iter(n, "fp32") == n * n * 4 + 8 * n * 4
+    assert gram_fista_bytes_per_iter(n, "fp32", symmetric=True) == (
+        (n * (n + 1) // 2) * 4 + 8 * n * 4
     )
+    assert gram_fista_flops_per_iter(n) == 2 * n * n + 9 * n
+    assert gram_setup_flops(5000, n) == 2 * 5000 * n * n + 2 * 5000 * n
 
-    per_shape = tier.per_shape[0]
-    assert tier.passed
-    assert per_shape.bytes_per_iter == dense_fista_bytes_per_iter(10, 20, "fp32")
-    assert per_shape.measured_ms_per_iter == pytest.approx(0.2)
-    assert per_shape.roofline_floor_ms_per_iter > 0.0
-    assert per_shape.roofline_pct_med > 0.0
-    assert tier.rank_summary["median_roofline_pct"] == per_shape.roofline_pct_med
-    assert tier.rank_summary["peak_bandwidth_gb_s"] == 100.0
+
+def test_roofline_hint_tall_regime_prefers_gram():
+    hint = roofline_hint(_lasso(5000, 2000))
+    assert hint["shape"]["regime"] == "tall"
+    # direct reads A twice (2mn), gram reads G once (n^2) -> ~5x on tall shape
+    assert hint["gram_vs_direct_byte_ratio"] == pytest.approx(5.0, rel=2e-3)
+    pi = hint["per_iter"]
+    assert pi["gram"]["bytes_per_iter_mb"] < pi["direct"]["bytes_per_iter_mb"]
+    assert pi["gram_symmetric"]["bytes_per_iter_mb"] < pi["gram"]["bytes_per_iter_mb"]
+    assert any("symv" in lever or "symmetric" in lever for lever in hint["levers"])
+
+
+def test_roofline_hint_wide_regime_prefers_direct():
+    hint = roofline_hint(_lasso(500, 4000))
+    assert hint["shape"]["regime"] == "wide"
+    # G is (n,n) with n>>m, so direct moves fewer bytes/iter
+    pi = hint["per_iter"]
+    assert pi["direct"]["bytes_per_iter_mb"] < pi["gram"]["bytes_per_iter_mb"]
+
+
+def test_amortization_crossover_solves():
+    assert amortization_crossover_solves(3414.0, 53.6, 20.6) == pytest.approx(
+        3414.0 / (53.6 - 20.6)
+    )
+    assert amortization_crossover_solves(1000.0, 20.0, 25.0) == float("inf")

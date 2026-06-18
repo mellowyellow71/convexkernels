@@ -564,6 +564,42 @@ h1 {{ font-size: 18px; margin: 0 0 4px 0; }}
 </body></html>"""
 
 
+def _render_tree(rows: list[dict]) -> str:
+    """ASCII parent→children experiment tree from lineage rows.
+
+    Accepted experiments are marked ✓ (they became checkpoint nodes); discarded
+    and crashed experiments stay in the tree as leaves so it is visible what was
+    already tried from each node. Roots are experiments whose parent is a
+    checkpoint (e.g. the seed) rather than another lineage row.
+    """
+    by_parent: dict = {}
+    ids = {r.get("id") for r in rows}
+    for r in rows:
+        by_parent.setdefault(r.get("parent_id"), []).append(r)
+
+    def fmt(r: dict) -> str:
+        d = r.get("decision") or {}
+        s = r.get("score") or {}
+        mark = "✓" if d.get("accepted") else "·"
+        ttk = s.get("time_to_kkt_s")
+        ttk_s = f"{ttk:.3f}s" if isinstance(ttk, (int, float)) and math.isfinite(ttk) else "—"
+        etype = (r.get("edit") or {}).get("type", "?")
+        return f"{mark} {(r.get('id') or '')[:8]} [{etype}] ttk={ttk_s} {d.get('reason', '')}"
+
+    lines: list[str] = []
+
+    def walk(node_id, depth: int) -> None:
+        for r in by_parent.get(node_id, []):
+            lines.append("    " * depth + fmt(r))
+            walk(r.get("id"), depth + 1)
+
+    roots = [p for p in by_parent if p not in ids]
+    for root in roots:
+        lines.append(f"● checkpoint {str(root)[:8] if root else 'seed'}")
+        walk(root, 1)
+    return "\n".join(lines) if lines else "(no experiments yet)"
+
+
 def _generate_once(paths: list[str], out: Path, refresh_sec: int) -> int:
     summaries = []
     for path_arg in paths:
@@ -589,7 +625,18 @@ def main(argv: list[str]) -> int:
                    help="auto-refresh meta tag interval in seconds (0 = no refresh)")
     p.add_argument("--watch", type=int, default=0,
                    help="re-render every N seconds (0 = render once and exit)")
+    p.add_argument("--tree", action="store_true",
+                   help="print the ASCII parent→children experiment tree and exit")
     args = p.parse_args(argv[1:])
+
+    if args.tree:
+        for path_arg in args.paths:
+            path = Path(path_arg)
+            if path.is_dir():
+                path = path / "lineage.jsonl"
+            print(f"== {path} ==")
+            print(_render_tree(_load(path)))
+        return 0
 
     out = Path(args.out)
     if args.watch <= 0:

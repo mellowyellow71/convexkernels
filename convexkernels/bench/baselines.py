@@ -116,21 +116,98 @@ def run_adelie(prob: Lasso, *, tol: float = 1e-12,
     return _result("adelie", x, None, wall, prob)
 
 
-def run_cvxpy(prob: Lasso, *, eps: float = 1e-12,
-              max_iter: int = 50000) -> BaselineResult:
-    """CVXPY/CLARABEL — interior-point oracle for ground truth."""
+# Per-solver kwarg for the max-iteration cap (used to build anytime curves).
+_MAXITER_KW = {
+    "CLARABEL": "max_iter",
+    "SCS": "max_iters",
+    "OSQP": "max_iter",
+    "ECOS": "max_iters",
+}
+
+
+def build_cvxpy_lasso(prob: Lasso):
+    """Build a (reusable) cvxpy LASSO problem; returns `(cvxprob, x_var)`.
+
+    Reusing one `cp.Problem` across an iteration-cap sweep means cvxpy
+    canonicalizes once (amortized), so each anytime-curve point reflects solver
+    convergence rather than repeated Python modeling overhead.
+    """
     import cvxpy as cp
+
     x = cp.Variable(prob.n)
     obj = 0.5 * cp.sum_squares(prob.A @ x - prob.b) + prob.lam * cp.norm1(x)
-    cvxprob = cp.Problem(cp.Minimize(obj))
+    return cp.Problem(cp.Minimize(obj)), x
+
+
+def _solver_kwargs(solver: str, max_iter: Optional[int], eps: float) -> dict:
+    kwargs: dict = {}
+    if max_iter is not None:
+        kwargs[_MAXITER_KW[solver]] = int(max_iter)
+    if solver == "CLARABEL":
+        kwargs.update(tol_gap_abs=eps, tol_gap_rel=eps, tol_feas=eps)
+    elif solver == "SCS":
+        kwargs.update(eps=eps)
+    elif solver == "OSQP":
+        kwargs.update(eps_abs=eps, eps_rel=eps)
+    elif solver == "ECOS":
+        kwargs.update(abstol=eps, reltol=eps, feastol=eps)
+    return kwargs
+
+
+def solve_existing_cvxpy(
+    cvxprob, x_var, solver: str, *,
+    max_iter: Optional[int] = None, eps: float = 1e-12,
+) -> tuple[Optional[np.ndarray], float]:
+    """Solve an already-built cvxpy problem; returns `(x, wall_time_s)`."""
+    import cvxpy as cp
+
+    kwargs = _solver_kwargs(solver, max_iter, eps)
     t0 = time.perf_counter()
-    cvxprob.solve(
-        solver=cp.CLARABEL,
-        tol_gap_abs=eps, tol_gap_rel=eps, tol_feas=eps,
-        max_iter=max_iter,
-    )
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            cvxprob.solve(solver=getattr(cp, solver), verbose=False, **kwargs)
+    except Exception:  # noqa: BLE001 — capped/failed solves are expected on the sweep
+        return None, time.perf_counter() - t0
     wall = time.perf_counter() - t0
-    return _result("cvxpy", np.asarray(x.value), None, wall, prob)
+    val = None if x_var.value is None else np.asarray(x_var.value)
+    return val, wall
 
 
-ALL_BASELINES = (run_numpy_fista, run_sklearn, run_adelie, run_cvxpy)
+def solve_cvxpy_lasso(
+    prob: Lasso, *, solver: str = "CLARABEL",
+    max_iter: Optional[int] = None, eps: float = 1e-12,
+) -> tuple[Optional[np.ndarray], float]:
+    """One-shot: build + solve the LASSO with a chosen cvxpy backend."""
+    cvxprob, x = build_cvxpy_lasso(prob)
+    return solve_existing_cvxpy(cvxprob, x, solver, max_iter=max_iter, eps=eps)
+
+
+def run_cvxpy(prob: Lasso, *, solver: str = "CLARABEL", eps: float = 1e-12,
+              max_iter: int = 50000) -> BaselineResult:
+    """CVXPY baseline. `solver` ∈ {CLARABEL (IPM), SCS, OSQP, ECOS}."""
+    x, wall = solve_cvxpy_lasso(prob, solver=solver, max_iter=max_iter, eps=eps)
+    if x is None:
+        x = np.zeros(prob.n)
+    return _result(solver.lower(), x, None, wall, prob)
+
+
+def run_scs(prob: Lasso, **kw) -> BaselineResult:
+    return run_cvxpy(prob, solver="SCS", **kw)
+
+
+def run_osqp(prob: Lasso, **kw) -> BaselineResult:
+    return run_cvxpy(prob, solver="OSQP", **kw)
+
+
+def run_ecos(prob: Lasso, **kw) -> BaselineResult:
+    return run_cvxpy(prob, solver="ECOS", **kw)
+
+
+# Names accepted by the cvxpy-backed anytime-curve machinery in `curves.py`.
+CVXPY_SOLVERS = ("CLARABEL", "SCS", "OSQP", "ECOS")
+
+ALL_BASELINES = (
+    run_numpy_fista, run_sklearn, run_adelie,
+    run_cvxpy, run_scs, run_osqp, run_ecos,
+)

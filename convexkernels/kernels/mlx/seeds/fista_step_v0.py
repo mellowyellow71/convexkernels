@@ -91,3 +91,27 @@ def fista_step(state: FistaStateMLX, problem: LassoMLX, t: float) -> FistaStateM
     )
 
     return FistaStateMLX(x=x_next, y=y_next, theta=theta_next)
+
+
+def solve(problem, recorder, *, kkt_tol, max_time_s, check_every: int = 25):
+    """Algorithm-open seed entry point: plain FISTA owning its own loop.
+
+    Reports progress through the trusted `Recorder` (which evaluates the KKT
+    on the canonical numpy problem) and stops when the target is reached or the
+    wall budget is spent.
+    """
+    state = init_state(problem)
+    t = 1.0 / problem.L
+    it = 0
+    while it < 100000:
+        it += 1
+        state = fista_step(state, problem, t)
+        if it % check_every == 0:
+            recorder.record(state.x)
+            if recorder.should_stop(kkt_tol):
+                break
+    recorder.record(state.x)
+    return state.x
+
+
+__all__ = ["FistaStateMLX", "init_state", "fista_step", "solve"]
