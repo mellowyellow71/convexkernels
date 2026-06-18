@@ -384,6 +384,17 @@ def run_synth_loop(
 
     history: list[dict] = []
 
+    # One-time analytical bandwidth/AI hint for this problem shape; steers the
+    # open algorithm search toward the bandwidth-favourable gradient form.
+    cost_model_hint: Optional[dict] = None
+    try:
+        from .roofline import roofline_hint
+
+        cost_model_hint = roofline_hint(problem)
+    except Exception as exc:  # noqa: BLE001 — hint is advisory, never fatal
+        if verbose:
+            print(f"[synth] roofline hint unavailable: {exc}")
+
     def _refresh_state() -> dict:
         champ = {
             "source_path": str(current_source_path) if current_source_path else None,
@@ -396,6 +407,7 @@ def run_synth_loop(
             baseline_times=baseline_times,
             champion=champ,
             kkt_tol=kkt_tol,
+            cost_model=cost_model_hint,
         )
         write_research_state(state_root / "research_state.json", state)
         return state

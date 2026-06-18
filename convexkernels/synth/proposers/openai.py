@@ -198,6 +198,31 @@ def _format_prompt(ctx: dict) -> str:
         )
     )
 
+    cm = state.get("hardware_cost_model") or {}
+    if cm:
+        shape = cm.get("shape") or {}
+        pi = cm.get("per_iter") or {}
+        sections.append("--- hardware cost model (analytical; per-iter memory traffic) ---")
+        sections.append(
+            "shape m={} n={} regime={} | bandwidth-bound, minimize bytes/iter".format(
+                shape.get("m"), shape.get("n"), shape.get("regime"),
+            )
+        )
+        for key in ("direct", "gram", "gram_symmetric"):
+            v = pi.get(key)
+            if v:
+                sections.append(
+                    "  {:14s} {:.3f} MB/iter  AI={:.2f}  floor={:.4f} ms/iter".format(
+                        key, v["bytes_per_iter_mb"],
+                        v["arithmetic_intensity_ops_per_byte"],
+                        v["roofline_floor_ms_per_iter"],
+                    )
+                )
+        if cm.get("amortization"):
+            sections.append("  " + str(cm["amortization"]))
+        for lever in cm.get("levers") or []:
+            sections.append("  lever: " + str(lever))
+
     tried = state.get("tried_directions") or []
     sections.append("--- tried directions (curated; don't repeat failures) ---")
     if tried:
