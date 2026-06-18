@@ -98,9 +98,17 @@ FISTA-Gram kernel). Go broad:
       needed (Pilanci's point: the quantized dot product IS the kernel).
     - Keep the iterate/soft-threshold path in fp32. The harness recomputes the
       trusted KKT in fp64 on your returned `X`, so quantization that's too
-      coarse will simply fail the gate — tune `bits`/`group_size` so you still
-      reach `kkt < 1e-5`. Mixed schemes (e.g. 8-bit early iters → fp32 polish)
-      are fair game.
+      coarse will simply fail the gate.
+    - **MEASURED (2026-06-16): a fully quantized gradient floors KKT at ~1.9e-3
+      (8-bit) / 3e-2 (4-bit) — it CANNOT reach the 1e-5 target.** Do NOT submit a
+      pure-quantized solve; it will fail the gate. The error-tolerant use is
+      *feature selection*: in an active-set / screening solver, compute the
+      periodic full-width `Aᵀ(Ay−b)` *violation check* in 8-bit to decide which
+      columns to add, but keep the reduced solve and the returned iterate in
+      fp32. That stacks on the active-set champion without breaking accuracy.
+    - Gotcha: `mx.quantize` needs the last axis divisible by `group_size`
+      (64/32). Hero's 50000/1000 are not — zero-pad the quantized axis (and the
+      matching operand rows) to a multiple of `group_size`.
   The same quantized-dot-product machinery is the bridge to a future second
   specimen (compressed RAG embedding / nearest-neighbor search) — design for it.
 - **Path structure**: per-column convergence masking, SAFE/STRONG screening,

@@ -2106,3 +2106,32 @@ time crosses the 1e-5 target well left of Adelie's converged point.
 - Only the hero shape is re-measured under the clean fast-L metric; the other
   path shapes still need a clean re-run.
 - Seed number is reps=1; champion-vs-Adelie (both 5-rep) is the defensible claim.
+
+## Reframe — quantization viability probe on hero (2026-06-16)
+
+Tested the advisor's quantization lever directly (MLX 0.31.2 `mx.quantize` /
+`mx.quantized_matmul`, gradient `Aᵀ(Ay−b)` as two quantized matmuls, A zero-
+padded to a multiple of group_size=64 since hero dims 50000/1000 aren't
+divisible).
+
+**Decisive negative result — quantization cannot meet the KKT<1e-5 contract:**
+| scheme | gradient rel-err | KKT plateau (best reached) | hits 1e-5? |
+|---|---:|---:|---|
+| 8-bit, gs=64 | 0.46% | **1.9e-3** | no |
+| 4-bit, gs=64 | 7.3% | 3.0e-2 | no |
+
+The quantization error in the gradient caps the achievable optimality ~2–3
+orders of magnitude above the target. A mixed quantized→fp32-polish scheme must
+switch to fp32 *above* the ~2e-3 plateau, at which point the expensive
+high-accuracy work is fp32 anyway, and it still cannot beat the active-set
+champion (1.375s). So **for the high-accuracy LASSO path, quantization is the
+wrong lever.** Its natural home is the *low-accuracy* regime the advisor cited
+(compressed embeddings / nearest-neighbor search, stable at ~1% error) — an
+argument for that being the right second specimen rather than a hero-LASSO lever.
+
+**One viable stacking angle remains:** inside the active-set champion, the
+periodic *full-gradient KKT-violation check* over all 50000 features is a
+feature-*selection* decision, which is tolerant of ~0.5% (8-bit) error. Quantize
+only that check; keep the reduced fp32 solve exact. This is the next experiment
+(run through the loop, branched from the active-set champion, so the fp64 gate
+guarantees the returned iterate is still exact).
