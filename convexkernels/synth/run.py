@@ -143,8 +143,8 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--state-root", required=True, type=Path)
     p.add_argument("--program-md", default="convexkernels/synth/program.md", type=Path)
     p.add_argument("--resume-from", default=None, help="checkpoint id to branch from")
-    p.add_argument("--no-baselines", action="store_true", help="skip the cvxpy baseline panel")
-    p.add_argument("--baseline-solvers", default="CLARABEL,SCS,OSQP,ECOS")
+    p.add_argument("--no-baselines", action="store_true", help="skip the baseline panel")
+    p.add_argument("--baseline-solvers", default="CLARABEL,SCS,OSQP,ECOS,sklearn,adelie")
     p.add_argument("--adelie-cache", default="auto",
                    help="path to a cached Adelie .npz to inject as the bar-to-beat "
                         "('auto' = convexkernels/bench/cache/adelie_path_<shape>.npz; "

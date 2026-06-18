@@ -12,6 +12,17 @@ cap costs more time and reaches a smaller residual. This is the standard
 anytime-benchmark construction when callbacks are unavailable. Curves are
 cached per problem on disk (baselines do not change between sessions).
 
+The panel also includes the *native fast-LASSO* solvers — scikit-learn
+(coordinate descent) and adelie (CD + screening) — traced the same way via each
+solver's own iteration cap. They are the real bar for LASSO: on typical shapes
+their time-to-target is one-to-two orders of magnitude below the generic conic
+panel, so omitting them lets a candidate "beat the baselines" while being far
+slower than a trivial fast-LASSO call. These are optional deps (`.[baselines]`);
+a missing one degrades to an empty curve (time_to_kkt = inf), never a crash.
+For a path, adelie is run as a single native multi-lambda `grpnet` solve
+(screening + warm-start across the path — its actual advantage), not K
+independent column solves.
+
 For a `LassoPath`, the path is scored as a whole: at iteration budget `N`, each
 column is solved (as a single LASSO) at cap `N`, the per-column solve times are
 summed (sequential path solve), and the trusted *max-over-columns* KKT of the
@@ -22,6 +33,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import time
 from pathlib import Path
 from typing import Optional, Sequence
 
@@ -35,6 +47,17 @@ from .metrics import time_to_target, trusted_kkt
 DEFAULT_SWEEP: tuple[int, ...] = (
     5, 10, 25, 50, 100, 200, 400, 800, 1600, 3200, 6400,
 )
+
+# cvxpy-backed conic/QP solvers vs. native fast-LASSO solvers. The latter are
+# the real bar to beat for LASSO (coordinate descent + screening), and are
+# optional deps (`.[baselines]`) — their curve builders degrade to an empty
+# curve (time_to_kkt = inf) when the package is not importable.
+CVXPY_CURVE_SOLVERS: tuple[str, ...] = ("CLARABEL", "SCS", "OSQP", "ECOS")
+NATIVE_CURVE_SOLVERS: tuple[str, ...] = ("sklearn", "adelie")
+
+# Default panel: generic convex solvers PLUS the fast LASSO solvers, so the
+# proposer's "bar to beat" includes adelie/sklearn, not only the conic panel.
+DEFAULT_PANEL_SOLVERS: tuple[str, ...] = CVXPY_CURVE_SOLVERS + NATIVE_CURVE_SOLVERS
 
 
 def problem_hash(problem) -> str:
@@ -87,11 +110,115 @@ def _path_curve(prob: LassoPath, solver: str, sweep: Sequence[int]) -> list[tupl
     return pts
 
 
+# --- native fast-LASSO solvers (coordinate descent / screening) -------------
+#
+# Unlike the conic solvers, these have no per-iteration callback either, so we
+# trace the same anytime curve by sweeping each solver's own iteration cap. They
+# solve in the (1/2m) scikit/glmnet parameterization, so lambda maps as
+# `alpha = lam / m`; the trusted KKT is always recomputed on the canonical
+# problem, so the comparison stays on the one ruler. Import is lazy and guarded:
+# a missing optional dep yields an empty curve (never crashes the panel).
+
+
+def _sklearn_lasso_coef(prob: Lasso, cap: int) -> tuple[Optional[np.ndarray], float]:
+    import warnings
+
+    from sklearn.linear_model import Lasso as SkLasso
+
+    model = SkLasso(
+        alpha=prob.lam / prob.m, fit_intercept=False,
+        max_iter=int(cap), tol=1e-14, selection="cyclic",
+    )
+    t0 = time.perf_counter()
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")  # capped fits warn on non-convergence
+        model.fit(prob.A, prob.b)
+    return np.asarray(model.coef_), time.perf_counter() - t0
+
+
+def _sklearn_curve(problem, sweep: Sequence[int]) -> list[tuple[float, float]]:
+    try:
+        import sklearn  # noqa: F401
+    except Exception:  # noqa: BLE001 — optional dep absent
+        return []
+    pts: list[tuple[float, float]] = []
+    if isinstance(problem, LassoPath):
+        for cap in sweep:
+            X = np.zeros((problem.n, problem.K))
+            total_t = 0.0
+            for k in range(problem.K):
+                col = Lasso(problem.A, problem.b, float(problem.lambdas[k]))
+                x, wall = _sklearn_lasso_coef(col, cap)
+                total_t += wall
+                X[:, k] = x
+            pts.append((total_t, trusted_kkt(problem, X)))
+    else:
+        for cap in sweep:
+            x, wall = _sklearn_lasso_coef(problem, cap)
+            pts.append((wall, trusted_kkt(problem, x)))
+    pts.sort(key=lambda p: p[0])
+    return pts
+
+
+def _adelie_curve(problem, sweep: Sequence[int]) -> list[tuple[float, float]]:
+    """adelie grpnet anytime curve.
+
+    For a path, adelie solves *all* lambdas in one `grpnet` call (screening +
+    warm-start across decreasing lambdas — its actual edge), so the path curve
+    is one native path solve per cap, not K independent column solves.
+    """
+    try:
+        import adelie as ad
+    except Exception:  # noqa: BLE001 — optional dep absent
+        return []
+
+    pts: list[tuple[float, float]] = []
+    if isinstance(problem, LassoPath):
+        A_f = np.asfortranarray(problem.A)
+        lmda_path = [float(v) for v in (problem.lambdas / problem.m)]
+        for cap in sweep:
+            t0 = time.perf_counter()
+            try:
+                state = ad.solver.grpnet(
+                    X=A_f, glm=ad.glm.gaussian(y=problem.b), intercept=False,
+                    lmda_path=lmda_path, tol=1e-14, max_iters=int(cap),
+                    progress_bar=False,
+                )
+            except Exception:  # noqa: BLE001 — capped solves may error
+                continue
+            wall = time.perf_counter() - t0
+            betas = np.asarray(state.betas.toarray())  # (K, n)
+            if betas.shape != (problem.K, problem.n):
+                continue
+            pts.append((wall, trusted_kkt(problem, betas.T)))
+    else:
+        A_f = np.asfortranarray(problem.A)
+        for cap in sweep:
+            t0 = time.perf_counter()
+            try:
+                state = ad.solver.grpnet(
+                    X=A_f, glm=ad.glm.gaussian(y=problem.b), intercept=False,
+                    lmda_path=[problem.lam / problem.m], tol=1e-14,
+                    max_iters=int(cap), progress_bar=False,
+                )
+            except Exception:  # noqa: BLE001
+                continue
+            wall = time.perf_counter() - t0
+            x = np.asarray(state.betas[-1].toarray()).squeeze()
+            pts.append((wall, trusted_kkt(problem, x)))
+    pts.sort(key=lambda p: p[0])
+    return pts
+
+
 def baseline_kkt_time_curve(
     problem, solver: str, sweep: Optional[Sequence[int]] = None,
 ) -> list[tuple[float, float]]:
     """Trace `(wall_time_s, kkt)` for `solver` on `problem` across a cap sweep."""
     sweep = tuple(sweep) if sweep is not None else DEFAULT_SWEEP
+    if solver == "sklearn":
+        return _sklearn_curve(problem, sweep)
+    if solver == "adelie":
+        return _adelie_curve(problem, sweep)
     if isinstance(problem, LassoPath):
         return _path_curve(problem, solver, sweep)
     return _single_curve(problem, solver, sweep)
@@ -105,7 +232,7 @@ def time_to_kkt(curve: Sequence[Sequence[float]], tol: float) -> float:
 def baseline_panel(
     problem,
     *,
-    solvers: Sequence[str] = ("CLARABEL", "SCS", "OSQP", "ECOS"),
+    solvers: Sequence[str] = DEFAULT_PANEL_SOLVERS,
     sweep: Optional[Sequence[int]] = None,
     cache_dir: Optional[Path] = None,
 ) -> dict[str, list[tuple[float, float]]]:
@@ -120,7 +247,9 @@ def baseline_panel(
             continue
         curve = baseline_kkt_time_curve(problem, solver, sweep)
         out[solver] = curve
-        if cpath is not None:
+        # Don't cache an empty curve: it means an optional solver (adelie/sklearn)
+        # was absent, and we want a later run with it installed to retry.
+        if cpath is not None and curve:
             cpath.parent.mkdir(parents=True, exist_ok=True)
             cpath.write_text(json.dumps(curve))
     return out

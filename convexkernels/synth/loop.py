@@ -282,7 +282,9 @@ def run_synth_loop(
     program_md: str = "",
     resume_from: Optional[str] = None,
     compute_baselines: bool = True,
-    baseline_solvers: tuple[str, ...] = ("CLARABEL", "SCS", "OSQP", "ECOS"),
+    baseline_solvers: tuple[str, ...] = (
+        "CLARABEL", "SCS", "OSQP", "ECOS", "sklearn", "adelie",
+    ),
     extra_baseline_curves: Optional[dict] = None,
     verbose: bool = False,
 ) -> list[LineageRow]:
