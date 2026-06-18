@@ -34,7 +34,7 @@ from typing import Any, Optional, Protocol
 from ..bench.curves import baseline_panel, problem_hash, time_to_kkt
 from .checkpoints import CheckpointStore
 from .lineage import Edit as _LineageEdit
-from .lineage import Slot
+from .lineage import Slot, load_records
 from .research_state import build_research_state, write_research_state
 from .sandbox import run_kernel, write_eval_config
 
@@ -129,6 +129,18 @@ def _slot_to_dict(slot: Slot) -> dict:
         "hardware": slot.hardware,
         "dtype": slot.dtype,
     }
+
+
+def _resume_history(lineage_path: Path, slot: Slot, resume_from: Optional[str]) -> list[dict]:
+    """Prior lineage rows for this slot, for repopulating `history` on resume.
+
+    Returns [] for a fresh run (no `resume_from`) or a missing log. Filtering by
+    slot keeps a multi-slot state_root from leaking another slot's directions.
+    """
+    if resume_from is None or not lineage_path.exists():
+        return []
+    slot_dict = _slot_to_dict(slot)
+    return [r for r in load_records(lineage_path) if (r.get("slot") or {}) == slot_dict]
 
 
 def _append_jsonl(path: Path, row: dict) -> None:
@@ -384,7 +396,12 @@ def run_synth_loop(
         )
         parent_id = seed_ck.id
 
-    history: list[dict] = []
+    # On resume, repopulate history from the durable lineage log so the curated
+    # research state (tried directions) and the duplicate-source guard — both of
+    # which scan `history` — survive across sessions.
+    history: list[dict] = _resume_history(lineage_path, slot, resume_from)
+    if resume_from is not None and verbose:
+        print(f"[synth] resume: reloaded {len(history)} prior lineage rows for this slot")
 
     # One-time analytical bandwidth/AI hint for this problem shape; steers the
     # open algorithm search toward the bandwidth-favourable gradient form.
