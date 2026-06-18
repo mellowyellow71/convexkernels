@@ -22,6 +22,57 @@ from functools import cached_property
 import numpy as np
 
 
+def spectral_norm_sq(
+    A: np.ndarray, *, iters: int = 200, tol: float = 1e-7, safety: float = 1.01,
+) -> float:
+    """Largest eigenvalue of A.T @ A (= ||A||_2^2) via power iteration.
+
+    This is the FISTA Lipschitz constant: the step size is 1/L, so L must be an
+    *upper bound* on the true spectral norm squared for convergence. Power
+    iteration's Rayleigh quotient approaches the top eigenvalue from below, so
+    the result is inflated by `safety` (1%) to stay a valid upper bound after a
+    finite number of iterations.
+
+    Iterates on the smaller of A A^T (m x m) or A^T A (n x n) — never forming the
+    matrix, only matvecs — so this is O(mn) per iter instead of the O(min(m,n)^2
+    max(m,n)) full SVD that `np.linalg.norm(A, 2)` runs. On wide p>>n this is the
+    difference between milliseconds and seconds.
+    """
+    A = np.ascontiguousarray(A, dtype=np.float64)
+    m, n = A.shape
+    rng = np.random.default_rng(0)
+    if m <= n:
+        # iterate (A A^T) u in R^m
+        u = rng.standard_normal(m)
+        u /= np.linalg.norm(u)
+        prev = 0.0
+        for _ in range(iters):
+            w = A @ (A.T @ u)          # (A A^T) u
+            nrm = np.linalg.norm(w)
+            if nrm == 0.0:
+                return 0.0
+            ev = float(u @ w)          # Rayleigh quotient (u is unit)
+            u = w / nrm
+            if abs(ev - prev) <= tol * max(ev, 1.0):
+                break
+            prev = ev
+    else:
+        v = rng.standard_normal(n)
+        v /= np.linalg.norm(v)
+        prev = 0.0
+        for _ in range(iters):
+            w = A.T @ (A @ v)          # (A^T A) v
+            nrm = np.linalg.norm(w)
+            if nrm == 0.0:
+                return 0.0
+            ev = float(v @ w)
+            v = w / nrm
+            if abs(ev - prev) <= tol * max(ev, 1.0):
+                break
+            prev = ev
+    return float(ev * safety)
+
+
 @dataclass
 class PreparedPath:
     """Precomputed quantities shared across the entire lambda path."""
@@ -72,8 +123,14 @@ class LassoPath:
 
     @cached_property
     def L(self) -> float:
-        """Spectral norm squared of A; the FISTA step size is 1/L."""
-        return float(np.linalg.norm(self.A, ord=2) ** 2)
+        """Spectral norm squared of A; the FISTA step size is 1/L.
+
+        Computed by power iteration (see `spectral_norm_sq`) rather than a full
+        SVD — on wide p>>n shapes the SVD dominated cold-start setup (~3s on the
+        hero shape) and is the same for every candidate, burying the solver
+        signal in the time-to-target metric.
+        """
+        return spectral_norm_sq(self.A)
 
     @cached_property
     def prepared(self) -> PreparedPath:

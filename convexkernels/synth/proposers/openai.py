@@ -90,9 +90,10 @@ class OpenAIProposer:
                                 "type": "string",
                                 "description": (
                                     "The complete replacement Python source for the kernel "
-                                    "module. Must define both the step function "
-                                    "(fista_step / pdhg_step) and init_state and any "
-                                    "helpers it needs."
+                                    "module. Must define `solve(problem, recorder, *, "
+                                    "kkt_tol, max_time_s) -> X` (and optionally "
+                                    "`prepare_problem`) plus any helpers it needs. The "
+                                    "algorithm is yours to choose."
                                 ),
                             },
                         },

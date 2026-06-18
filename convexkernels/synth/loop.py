@@ -283,6 +283,7 @@ def run_synth_loop(
     resume_from: Optional[str] = None,
     compute_baselines: bool = True,
     baseline_solvers: tuple[str, ...] = ("CLARABEL", "SCS", "OSQP", "ECOS"),
+    extra_baseline_curves: Optional[dict] = None,
     verbose: bool = False,
 ) -> list[LineageRow]:
     """Run a full autoresearch session. Durable state under `state_root`:
@@ -301,18 +302,28 @@ def run_synth_loop(
 
     # ---- baseline panel: the bar to beat ----
     baseline_times: dict[str, float] = {}
+    panel: dict[str, list] = {}
     if compute_baselines:
         try:
             panel = baseline_panel(
                 problem, solvers=baseline_solvers,
                 cache_dir=state_root / "baselines",
             )
-            baseline_times = {
-                name: time_to_kkt(curve, kkt_tol) for name, curve in panel.items()
-            }
         except Exception as exc:  # noqa: BLE001
             if verbose:
                 print(f"[synth] baseline panel failed: {exc}")
+    # Injected curves (e.g. cached Adelie on the hero shape, where the cvxpy
+    # interior-point panel is intractable). Persist them under the baselines
+    # cache dir so the end-of-run plot overlays them too.
+    if extra_baseline_curves:
+        bdir = state_root / "baselines" / phash
+        bdir.mkdir(parents=True, exist_ok=True)
+        for name, curve in extra_baseline_curves.items():
+            panel[name] = curve
+            (bdir / f"{name}.json").write_text(json.dumps(curve))
+    baseline_times = {
+        name: time_to_kkt(curve, kkt_tol) for name, curve in panel.items()
+    }
     best_baseline = (None, float("inf"))
     if baseline_times:
         bl = min(baseline_times.items(), key=lambda kv: kv[1])

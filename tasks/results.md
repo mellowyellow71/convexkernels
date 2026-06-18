@@ -1966,3 +1966,143 @@ across the full path, and ADMM converges in dramatically fewer iters
 than FISTA on dense convex problems. This is the A/B comparison the
 plan calls for; the wide-hero result above suggests we may want to
 pivot focal algorithm to ADMM for wide regimes.
+
+## Reframe: KKT-verified time-to-target — first experiments (2026-06-16)
+
+Branch `reframe/time-to-target` (PR #3). Spec is now `(problem, hardware)`;
+algorithm/precision/quantization are the search space. Candidates own
+`solve(problem, recorder, *, kkt_tol, max_time_s)`; scored on cold-start
+`total_time_s = setup + time_to_kkt` to a trusted scale-free KKT target.
+
+### Setup fixes applied
+- **Target 1e-6 → 1e-5.** End-to-end fp32 FISTA plateaus at trusted KKT
+  ~1.2e-6 (wide_small) / 2.75e-6 (tall_medium) — the fp32 gradient rounding
+  floor. 1e-6 is unreachable without an fp64/refinement polish, so the
+  everyday gate is 1e-5; reaching 1e-6 is now a documented research lever.
+  (program.md updated.)
+- **Path baseline curve was empty/brittle.** `_path_curve` dropped a whole
+  iteration-cap sample if *any one* column failed to return an iterate; on
+  n=2000 the hard small-λ columns fail at every cap → empty curve. Fixed:
+  a failed column keeps its zero vector (honest "not-yet-converged"), so the
+  cap still yields a point. (`bench/curves.py`.)
+- **Device warm-up before the setup timer** (`_eval_kernel.py`) — harmless
+  insurance; turned out NOT to be the setup cost (see below).
+
+### Experiment 1 — path_tall_medium, 12 OpenAI proposals (gpt-5.5, medium), no baselines
+- Loop ran end-to-end; **3 accepted champions**, each beating the last:
+  seed ~4.07s → 2.486s (0.61×) → 2.073s (0.83×) → **1.890s (0.91×)** total,
+  all KKT-verified at <1e-5. Net ~2.15× on the cold-start total-time metric.
+- Champion (`cfa586cb`): direct (no-Gram) batched FISTA + **column screening**
+  (drop λ ≥ ‖Aᵀb‖∞ columns whose optimum is exactly 0) + skip the
+  uninformative first KKT check. Convex-correct; verified by the trusted ruler.
+
+### Key finding — total_time on tall_medium is setup-dominated, and setup is the SVD-based L
+- Champion `result.json`: `setup_time_s≈1.9–2.0s`, `solve_time_s≈0.05s`,
+  `time_to_kkt_s≈0.02s`. The solve to KKT<1e-5 is ~50 ms; **97% of total_time
+  is one-time setup.**
+- Instrumented: the setup cost is **`prob.L` (largest singular value via SVD)
+  ≈ 3.0s** on the canonical numpy problem — NOT Metal context init (a scalar
+  warm-up did not change it). This is the same issue flagged pre-pivot
+  ("Lasso.L via SVD is slow; power iteration would close the gap").
+- Consequence: on small/medium shapes the metric mostly measures the shared
+  SVD, which is identical across candidates, so the inner-solver/precision/
+  quantization signal is buried. The measured 2.15× came from the champion
+  avoiding the Gram precompute + a slightly cheaper recorder/screen schedule,
+  not from a better inner kernel.
+
+### Baseline-panel scaling (cvxpy)
+- Anytime curves via an 11-cap `max_iter` sweep × K=50 columns × N solvers is
+  O(550·N) full cvxpy solves. Interior-point (CLARABEL/ECOS) on n=2000 ran
+  >40 min without finishing; even SCS took ~20 min/solver. On hero (n=50000)
+  cvxpy is flatly intractable. **Implications:** (a) interior-point baselines
+  need a single-converged-solve point, not a cap sweep; (b) the hero headline
+  must use the cached Adelie reference (4131.8 ms), not the cvxpy panel.
+
+### Next levers
+1. **Fast L (power iteration) + treat L as shared, untimed-or-amortized
+   precompute** so total_time reflects the solver, not the SVD. Prerequisite
+   for any meaningful precision/quantization measurement on small/medium shapes.
+2. **Hero (n=50000) vs Adelie bar** — solve-dominated regime where inner-kernel,
+   screening, warm-start, fp16/quantization actually move total_time.
+3. **Quantization (Pilanci-style)**: quantize A/G to 4/8-bit for the gradient
+   matvecs with fp32 KKT verification — most impactful on hero's two-matmul
+   direct gradient.
+
+## Reframe — fast-L fix + hero baseline wiring (2026-06-16)
+
+Acting on the setup-dominated finding above, three changes landed:
+
+1. **Fast Lipschitz constant (`frontend/lasso_path.py:spectral_norm_sq`).**
+   Replaced `np.linalg.norm(A, 2)**2` (full SVD, ~3s tall_medium / ~9.6s hero)
+   with power iteration on the smaller of `A Aᵀ`/`AᵀA` (matvecs only), inflated
+   by 1% so L stays a valid FISTA upper bound. Verified: always ≥ exact SVD,
+   within 1% on random shapes; hero 9.6s→3.5s standalone. **In the loop the
+   numpy L is computed once in-parent and travels in the problem pickle, so
+   per-eval setup on hero dropped from ~3.5s to 0.077s** — the metric is now
+   solve-dominated and candidate deltas reflect the actual solver.
+
+2. **Cached-Adelie bar (`bench/curves.py:cached_adelie_curve`, loop
+   `extra_baseline_curves`, run `--adelie-cache`).** On hero the cvxpy
+   interior-point panel is intractable, so the bar-to-beat is the cached Adelie
+   full-path solve scored on the trusted ruler: one point
+   `(4.13s, ~6e-6)`. It's injected into `bar_to_beat` (proposer context),
+   the `_decide` telemetry tag, and persisted as `baselines/<hash>/ADELIE.json`
+   so the gap-vs-time plot overlays it. cvxpy panel skipped via `--no-baselines`.
+
+3. **Quantization lever spelled out in program.md.** Concrete MLX API
+   (`mx.quantize`, `mx.quantized_matmul` with `transpose`, fp32 soft-threshold,
+   fp64 trusted-KKT gate) so the proposer can implement Pilanci-style 4/8-bit
+   gradient matvecs without guessing — flagged as the priority hero lever
+   (G=AᵀA is 10 GB and doesn't fit, so the bandwidth-bound two-matmul direct
+   gradient is exactly what quantizing A shrinks).
+
+### Clean hero baseline (seed-only, reps=1, kkt_tol=1e-5, fast-L, warmup=0)
+| method | time to KKT<1e-5 | final KKT | note |
+|---|---:|---:|---|
+| **Adelie** (cached, CPU CD) | **4.13s** | ~6e-6 | the bar |
+| seed (batched FISTA, direct fp32) | **13.58s** | 9.91e-6 | setup 0.077s, solve 36.9s wall to plateau |
+
+Seed is **3.3× slower than Adelie** at 1e-5 on hero (was 8.4× at 1e-6 in Phase 2;
+the gap shrinks at the reachable target). This is now a clean, solve-dominated
+gap for the autoresearch loop + quantization to close. First hero OpenAI
+proposal batch (10 proposals) running.
+
+## Reframe — FIRST HERO WIN: 3.01× faster than Adelie (2026-06-16)
+
+First OpenAI hero batch (10 proposals, gpt-5.5 medium, kkt_tol=1e-5, Adelie bar
+injected, fast-L). **2 kept / 8 discarded; 1 crash (MLX AttributeError, handled).**
+
+Champion `8ec436d1` — **adaptive active-set restarted FISTA**:
+- Screen a small feature union from |Aᵀb|; solve the reduced LASSO path
+  (Gram gradient when the active set is small, direct reduced gradient when it
+  grows); expand the set via full-space gradient KKT violations; warm-started
+  full-FISTA fallback if the active loop doesn't certify.
+- It rediscovered Adelie's active-set/working-set strategy and ran it INSIDE the
+  batched-FISTA form — the "compose the playbook, don't replace the algorithm"
+  outcome the project targeted. The harness re-verifies the full (n,K) iterate
+  in fp64 (anti-gaming), so correctness holds regardless of the heuristic.
+
+### Confirmed result (5-rep, warmup=1, fp64-verified each rep)
+| method | time to KKT<1e-5 | KKT | reps | note |
+|---|---:|---:|---:|---|
+| Adelie (cached, CPU CD) | 4.132s | ~6e-6 | 5 | the bar |
+| seed (batched FISTA direct) | 13.58s | 9.9e-6 | 1 | 3.3× slower than Adelie |
+| **champion (active-set FISTA)** | **1.375s** | 7.46e-6 | 5 | **3.01× faster than Adelie**, ~9.9× over seed |
+
+Per-rep ttk: 1.344 / 1.349 / 1.375 / 1.386 / 1.375 s (≈3% spread — robust, not
+single-rep noise). Plot: `synth_run_hero_quant_01/plots/*.png` — champion KKT-vs-
+time crosses the 1e-5 target well left of Adelie's converged point.
+
+### Honest caveats / next
+- **Win was active-set screening, NOT quantization.** The proposer chose the
+  screening lever; quantization (the advisor's specific interest) was never
+  tried in this batch despite the program.md priority flag. Next batch should
+  force/seed quantization (e.g. hand-written 4/8-bit `mx.quantized_matmul`
+  gradient as a checkpoint to branch from) to test it as an *additional*
+  multiplier on top of active-set.
+- The early proposals (2–5) clustered at the seed (13–17s) exploring; the
+  active-set idea only appeared at proposal 7. A larger batch / better seeding
+  would surface it sooner.
+- Only the hero shape is re-measured under the clean fast-L metric; the other
+  path shapes still need a clean re-run.
+- Seed number is reps=1; champion-vs-Adelie (both 5-rep) is the defensible claim.

@@ -143,8 +143,12 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--state-root", required=True, type=Path)
     p.add_argument("--program-md", default="convexkernels/synth/program.md", type=Path)
     p.add_argument("--resume-from", default=None, help="checkpoint id to branch from")
-    p.add_argument("--no-baselines", action="store_true", help="skip the baseline panel")
+    p.add_argument("--no-baselines", action="store_true", help="skip the cvxpy baseline panel")
     p.add_argument("--baseline-solvers", default="CLARABEL,SCS,OSQP,ECOS")
+    p.add_argument("--adelie-cache", default="auto",
+                   help="path to a cached Adelie .npz to inject as the bar-to-beat "
+                        "('auto' = convexkernels/bench/cache/adelie_path_<shape>.npz; "
+                        "'none' to disable)")
     p.add_argument("--verbose", action="store_true", default=True)
     args = p.parse_args(argv)
 
@@ -158,6 +162,23 @@ def main(argv: list[str] | None = None) -> int:
     program_md = ""
     if args.program_md and args.program_md.exists():
         program_md = args.program_md.read_text()
+
+    # Resolve an optional cached Adelie reference to inject as the bar-to-beat.
+    extra_baseline_curves = None
+    if args.adelie_cache != "none":
+        if args.adelie_cache == "auto":
+            cache_path = Path("convexkernels/bench/cache") / f"adelie_path_{args.shape}.npz"
+        else:
+            cache_path = Path(args.adelie_cache)
+        if cache_path.exists():
+            from ..bench.curves import cached_adelie_curve
+            try:
+                extra_baseline_curves = {"ADELIE": cached_adelie_curve(problem, cache_path)}
+                print(f"[run] injected Adelie bar from {cache_path}")
+            except Exception as exc:  # noqa: BLE001
+                print(f"[run] could not load Adelie cache {cache_path}: {exc}")
+        elif args.adelie_cache != "auto":
+            print(f"[run] adelie cache not found: {cache_path}")
 
     if args.proposer == "openai":
         proposer = OpenAIProposer(
@@ -188,6 +209,7 @@ def main(argv: list[str] | None = None) -> int:
         resume_from=args.resume_from,
         compute_baselines=not args.no_baselines,
         baseline_solvers=tuple(s.strip() for s in args.baseline_solvers.split(",") if s.strip()),
+        extra_baseline_curves=extra_baseline_curves,
         verbose=args.verbose,
     )
 

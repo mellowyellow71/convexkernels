@@ -71,18 +71,17 @@ def _path_curve(prob: LassoPath, solver: str, sweep: Sequence[int]) -> list[tupl
 
     pts: list[tuple[float, float]] = []
     for cap in sweep:
+        # A column that fails / hasn't produced an iterate at this cap keeps its
+        # zero vector — an honest "not yet converged" reading for that column —
+        # rather than voiding the whole path point (one hard small-lambda column
+        # must not collapse the entire cap's curve sample).
         X = np.zeros((prob.n, prob.K))
         total_t = 0.0
-        ok = True
         for k, (cvxprob, x_var) in enumerate(cols):
             x, wall = solve_existing_cvxpy(cvxprob, x_var, solver, max_iter=int(cap))
             total_t += wall
-            if x is None:
-                ok = False
-                break
-            X[:, k] = x
-        if not ok:
-            continue
+            if x is not None:
+                X[:, k] = x
         pts.append((total_t, trusted_kkt(prob, X)))
     pts.sort(key=lambda p: p[0])
     return pts
@@ -125,6 +124,26 @@ def baseline_panel(
             cpath.parent.mkdir(parents=True, exist_ok=True)
             cpath.write_text(json.dumps(curve))
     return out
+
+
+def cached_adelie_curve(problem, npz_path) -> list[tuple[float, float]]:
+    """One-point anytime curve for the cached Adelie reference solution.
+
+    Adelie (glmnet-family coordinate descent) is the strong CPU baseline and the
+    headline target on the wide hero shape, where the cvxpy interior-point panel
+    is intractable. We cache its full-path solve `(X, wall_ms)` offline; here we
+    score that single converged endpoint on the *same* trusted KKT ruler so it
+    drops onto the gap-vs-time plot and into the `bar_to_beat` as one point
+    `(wall_s, trusted_kkt(problem, X_adelie))`.
+    """
+    d = np.load(npz_path, allow_pickle=True)
+    X = np.asarray(d["X"], dtype=np.float64)
+    if X.shape != (problem.n, problem.K):
+        raise ValueError(
+            f"adelie cache shape {X.shape} != problem (n,K)=({problem.n},{problem.K})"
+        )
+    wall_s = float(d["wall_ms"]) / 1000.0
+    return [(wall_s, trusted_kkt(problem, X))]
 
 
 def best_baseline_time_to_kkt(

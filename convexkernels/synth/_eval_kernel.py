@@ -120,6 +120,21 @@ def main(run_dir: str) -> int:
         max_time_s = float(config.get("max_time_s", 60.0))
         solve_name = config.get("kernel_solve", "solve")
 
+        # ---- warm the accelerator before timing setup ----
+        # The first mx.eval in a fresh subprocess pays a fixed ~1.5-2s Metal
+        # context cold-init. That is a per-process artifact, identical for every
+        # candidate and NOT paid by the in-process cvxpy baselines, so charging
+        # it to a candidate's setup would dwarf the real algorithmic setup
+        # (data upload, Gram precompute) on small/medium shapes. Force context
+        # init here so the timed setup measures solver work, not device boot.
+        if config.get("problem_backend") == "mlx":
+            try:
+                import mlx.core as mx  # type: ignore
+
+                mx.eval(mx.array([0.0]) + 1.0)
+            except Exception:
+                pass
+
         # ---- setup (timed) ----
         setup_t0 = perf_counter()
         kernel_module = _load_kernel_module(config["kernel_module"])
