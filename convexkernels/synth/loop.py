@@ -32,10 +32,16 @@ from pathlib import Path
 from typing import Any, Optional, Protocol
 
 from ..bench.curves import baseline_panel, problem_hash, time_to_kkt
+from .analyst import Analyst, StubAnalyst
 from .checkpoints import CheckpointStore
+from .director import CHAMPION, Director, Directive, StubDirector
 from .lineage import Edit as _LineageEdit
 from .lineage import Slot, load_records
-from .research_state import build_research_state, write_research_state
+from .research_state import (
+    build_research_state,
+    build_tree_summary,
+    write_research_state,
+)
 from .sandbox import run_kernel, write_eval_config
 
 
@@ -250,6 +256,64 @@ def _decide(
     return True, f"keep:beats_champion({ratio:.2f}x){bl_tag}"
 
 
+# ---------- strategy (Director) ----------
+
+
+def _maybe_direct(
+    director: Director,
+    director_state: dict,
+    i: int,
+    every_k: int,
+    last: Optional[Directive],
+    verbose: bool,
+) -> Directive:
+    """Call the Director on steps where i % every_k == 0, else replay `last`.
+
+    A Director exception degrades to the default (greedy-from-champion) directive
+    so a strategy failure never aborts the run — parity with proposer-crash
+    resilience.
+    """
+    if every_k > 1 and i % every_k != 0 and last is not None:
+        return last
+    try:
+        return director.direct(director_state)
+    except Exception as exc:  # noqa: BLE001 — strategy is advisory, never fatal
+        if verbose:
+            print(f"[synth] director failed ({type(exc).__name__}: {exc}); using champion")
+        return Directive()
+
+
+def _resolve_branch(
+    directive: Directive,
+    store: CheckpointStore,
+    champion_id: Optional[str],
+    champion_source_path: Optional[Path],
+) -> tuple[Optional[str], Optional[Path]]:
+    """Resolve the directive's branch point to (parent_id, source_path).
+
+    The CHAMPION sentinel (or an unknown/missing checkpoint id) falls back to the
+    current global champion — i.e. today's behavior. A valid non-champion id
+    routes the next proposal to branch from that earlier node (backtracking),
+    built entirely on the existing CheckpointStore tree.
+    """
+    if not directive.branch_from or directive.branch_from == CHAMPION:
+        return champion_id, champion_source_path
+    ck = store.get(directive.branch_from)
+    if ck is None:
+        return champion_id, champion_source_path
+    return ck.id, ck.source_path
+
+
+def _safe_analyze(analyst: Analyst, candidate_ctx: dict, verbose: bool) -> str:
+    """Advisory analyst call; a failure yields no note (never fatal)."""
+    try:
+        return analyst.analyze(candidate_ctx) or ""
+    except Exception as exc:  # noqa: BLE001 — advisory, never fatal
+        if verbose:
+            print(f"[synth] analyst failed ({type(exc).__name__}: {exc})")
+        return ""
+
+
 # ---------- proposal context ----------
 
 
@@ -262,6 +326,7 @@ def _build_proposal_ctx(
     kkt_tol: float,
     margin: float,
     program_md: str,
+    directive: Optional[Directive] = None,
 ) -> dict:
     src = ""
     if current_source_path is not None and current_source_path.exists():
@@ -275,6 +340,7 @@ def _build_proposal_ctx(
         "current_source_path": str(current_source_path) if current_source_path else None,
         "current_score": asdict(current_score),
         "research_state": research_state,
+        "directive": asdict(directive) if directive is not None else None,
     }
 
 
@@ -305,6 +371,9 @@ def run_synth_loop(
         "CLARABEL", "SCS", "OSQP", "ECOS", "sklearn", "adelie",
     ),
     extra_baseline_curves: Optional[dict] = None,
+    director: Optional[Director] = None,
+    analyst: Optional[Analyst] = None,
+    director_every_k: int = 1,
     verbose: bool = False,
 ) -> list[LineageRow]:
     """Run a full autoresearch session. Durable state under `state_root`:
@@ -317,9 +386,17 @@ def run_synth_loop(
     state_root = Path(state_root)
     runs_root = state_root / "runs"
     lineage_path = state_root / "lineage.jsonl"
+    directives_path = state_root / "directives.jsonl"
     runs_root.mkdir(parents=True, exist_ok=True)
     store = CheckpointStore(state_root)
     phash = problem_hash(problem)
+
+    # Strategy layer. Defaults (StubDirector/StubAnalyst) reproduce the prior
+    # greedy-from-champion behavior exactly: the directive is the no-op sentinel,
+    # branches always resolve to the champion, and no analyst notes are produced.
+    director = director or StubDirector()
+    analyst = analyst or StubAnalyst()
+    analyst_notes: list[str] = []
 
     # ---- baseline panel: the bar to beat ----
     baseline_times: dict[str, float] = {}
@@ -353,14 +430,16 @@ def run_synth_loop(
         print(f"[synth] baselines time_to_kkt: {baseline_times}")
 
     # ---- resolve the starting point (resume checkpoint or seed) ----
-    parent_id: Optional[str] = None
+    # `champion_id` is the current global-champion checkpoint node; per-proposal
+    # branch points are resolved from the Director's directive each iteration.
+    champion_id: Optional[str] = None
     if resume_from is not None:
         ck = store.get(resume_from)
         if ck is None:
             raise RuntimeError(f"resume checkpoint not found: {resume_from}")
         current_source_path: Optional[Path] = ck.source_path
         current_kernel_module = str(ck.source_path)
-        parent_id = ck.id
+        champion_id = ck.id
         if verbose:
             print(f"[synth] resuming from checkpoint {ck.id}")
     else:
@@ -401,7 +480,7 @@ def run_synth_loop(
             score=asdict(base_score), trajectory=base_score.trajectory,
             algorithm_tag="seed", problem_hash=phash,
         )
-        parent_id = seed_ck.id
+        champion_id = seed_ck.id
 
     # On resume, repopulate history from the durable lineage log so the curated
     # research state (tried directions) and the duplicate-source guard — both of
@@ -434,22 +513,57 @@ def run_synth_loop(
             champion=champ,
             kkt_tol=kkt_tol,
             cost_model=cost_model_hint,
+            analyst_notes=analyst_notes,
         )
         write_research_state(state_root / "research_state.json", state)
         return state
 
     appended: list[LineageRow] = []
+    last_directive: Optional[Directive] = None
     for i in range(n_proposals):
         research_state = _refresh_state()
+
+        # --- strategy: Director picks the branch point + search direction ---
+        director_state = {
+            "research_state": research_state,
+            "tree_summary": build_tree_summary(store.all(), problem_hash=phash),
+            "kkt_tol": kkt_tol,
+            "champion_id": champion_id,
+        }
+        directive = _maybe_direct(
+            director, director_state, i, director_every_k, last_directive, verbose,
+        )
+        last_directive = directive
+        if not directive.is_default():
+            _append_jsonl(directives_path, {"i": i, **asdict(directive)})
+        if directive.signal == "stop":
+            if verbose:
+                print(f"[synth] {i+1}/{n_proposals}: director signalled stop")
+            break
+        # Resolve the branch point through the existing CheckpointStore tree.
+        parent_id, branch_source_path = _resolve_branch(
+            directive, store, champion_id, current_source_path,
+        )
+
         ctx = _build_proposal_ctx(
             slot=slot,
-            current_source_path=current_source_path,
-            current_score=current_score,
+            current_source_path=branch_source_path,  # source the proposer rewrites
+            current_score=current_score,             # the bar (global champion)
             research_state=research_state,
             kkt_tol=kkt_tol,
             margin=margin,
             program_md=program_md,
+            directive=directive,
         )
+
+        def _edit_dict(e) -> dict:
+            return {
+                "type": e.type, "rationale": e.rationale,
+                "proposer_role": e.proposer_role,
+                "algorithm_family": e.algorithm_family,
+                "directive_signal": directive.signal,
+                "branch_from": parent_id,
+            }
 
         def _record(row: LineageRow) -> None:
             history.append(asdict(row))
@@ -462,7 +576,8 @@ def run_synth_loop(
             _record(LineageRow(
                 id=_new_id(), parent_id=parent_id, generation=len(appended) + 1,
                 created_at=_now_iso(), slot=_slot_to_dict(slot),
-                edit={"type": "n/a", "rationale": "", "proposer_role": "impl"},
+                edit={"type": "n/a", "rationale": "", "proposer_role": "impl",
+                      "directive_signal": directive.signal, "branch_from": parent_id},
                 source={"path": "", "hash": ""}, score=None,
                 decision={"accepted": False, "reason": f"crash:proposer_error:{type(exc).__name__}"},
             ))
@@ -474,7 +589,7 @@ def run_synth_loop(
             _record(LineageRow(
                 id=_new_id(), parent_id=parent_id, generation=len(appended) + 1,
                 created_at=_now_iso(), slot=_slot_to_dict(slot),
-                edit={"type": edit.type, "rationale": edit.rationale, "proposer_role": edit.proposer_role, "algorithm_family": edit.algorithm_family},
+                edit=_edit_dict(edit),
                 source={"path": "", "hash": ""}, score=None,
                 decision={"accepted": False, "reason": "discard:empty_source"},
             ))
@@ -485,7 +600,7 @@ def run_synth_loop(
             _record(LineageRow(
                 id=_new_id(), parent_id=parent_id, generation=len(appended) + 1,
                 created_at=_now_iso(), slot=_slot_to_dict(slot),
-                edit={"type": edit.type, "rationale": edit.rationale, "proposer_role": edit.proposer_role, "algorithm_family": edit.algorithm_family},
+                edit=_edit_dict(edit),
                 source={"path": "", "hash": source_hash}, score=None,
                 decision={"accepted": False, "reason": "discard:duplicate_source"},
             ))
@@ -515,7 +630,7 @@ def run_synth_loop(
             _record(LineageRow(
                 id=run_id, parent_id=parent_id, generation=len(appended) + 1,
                 created_at=_now_iso(), slot=_slot_to_dict(slot),
-                edit={"type": edit.type, "rationale": edit.rationale, "proposer_role": edit.proposer_role, "algorithm_family": edit.algorithm_family},
+                edit=_edit_dict(edit),
                 source={"path": str(candidate_path), "hash": source_hash}, score=None,
                 decision={"accepted": False, "reason": f"crash:{cand_err}"},
             ))
@@ -527,7 +642,7 @@ def run_synth_loop(
         row = LineageRow(
             id=run_id, parent_id=parent_id, generation=len(appended) + 1,
             created_at=_now_iso(), slot=_slot_to_dict(slot),
-            edit={"type": edit.type, "rationale": edit.rationale, "proposer_role": edit.proposer_role},
+            edit=_edit_dict(edit),
             source={"path": str(candidate_path), "hash": source_hash},
             score=asdict(cand_score),
             decision={"accepted": kept, "reason": reason},
@@ -540,6 +655,8 @@ def run_synth_loop(
                   f"total={cand_score.total_time_s:.3f}s kkt={cand_score.kkt_final:.2e}")
 
         if kept:
+            # The accepted candidate branches from `parent_id` (the directed
+            # branch point) and becomes the new global champion.
             store.save(
                 id=run_id, parent_id=parent_id,
                 source=edit.full_source,
@@ -551,7 +668,19 @@ def run_synth_loop(
             current_source_path = candidate_path
             current_kernel_module = str(candidate_path)
             current_score = cand_score
-            parent_id = run_id  # subsequent proposals branch from the new node
+            champion_id = run_id
+        else:
+            # Advisory only: the Analyst explains the failure to the Director on
+            # the next step. It never touches the accept/reject gate above.
+            note = _safe_analyze(analyst, {
+                "rationale": edit.rationale,
+                "algorithm_family": edit.algorithm_family,
+                "reason": reason,
+                "score": asdict(cand_score),
+                "champion_total_time_s": current_score.total_time_s,
+            }, verbose)
+            if note:
+                analyst_notes.append(note)
 
     _refresh_state()
 

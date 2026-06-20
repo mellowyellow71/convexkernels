@@ -38,6 +38,51 @@ def _idea_key(row: dict) -> str:
     return str(edit.get("type") or "other").strip().lower()
 
 
+def build_tree_summary(
+    checkpoints: list,
+    *,
+    problem_hash: str,
+    max_nodes: int = 20,
+) -> dict:
+    """Bounded summary of the branchable checkpoint tree for the Director.
+
+    One row per checkpoint (filtered to `problem_hash`): the full `id` (the
+    Director must return a real id to branch from), `parent_id`, `algorithm_tag`,
+    the score triple, and `n_children` (so the Director can see which lines are
+    saturated/already-explored). Capped at `max_nodes` — keep the root plus the
+    best-N by `total_time_s` — to preserve the anti-context-rot bound. This is the
+    ONLY view of history the Director gets beyond the curated digest, and it is
+    still derived from the durable tree, never raw lineage.
+    """
+    nodes = [c for c in checkpoints if getattr(c, "problem_hash", None) == problem_hash]
+    child_count: dict[str, int] = {}
+    for c in nodes:
+        pid = getattr(c, "parent_id", None)
+        if pid:
+            child_count[pid] = child_count.get(pid, 0) + 1
+
+    def _row(c) -> dict:
+        return {
+            "id": c.id,
+            "parent_id": c.parent_id,
+            "algorithm_tag": c.algorithm_tag,
+            "total_time_s": c.total_time_s,
+            "time_to_kkt_s": c.time_to_kkt_s,
+            "kkt_final": c.kkt_final,
+            "n_children": child_count.get(c.id, 0),
+        }
+
+    if len(nodes) > max_nodes:
+        roots = [c for c in nodes if not c.parent_id]
+        rest = [c for c in nodes if c.parent_id]
+        rest.sort(key=lambda c: (c.total_time_s if c.total_time_s is not None else float("inf")))
+        kept = roots + rest[: max(0, max_nodes - len(roots))]
+        keep_ids = {c.id for c in kept}
+        nodes = [c for c in nodes if c.id in keep_ids]
+
+    return {"nodes": [_row(c) for c in nodes], "n_total": len(checkpoints)}
+
+
 def build_research_state(
     *,
     lineage_rows: list[dict],
@@ -46,12 +91,18 @@ def build_research_state(
     kkt_tol: float,
     max_ideas: int = 12,
     cost_model: Optional[dict] = None,
+    analyst_notes: Optional[list] = None,
+    max_notes: int = 8,
 ) -> dict:
     """Assemble the compact state dict from the durable tree + baselines.
 
     `cost_model` is an optional analytical bandwidth/AI hint for the active
     problem shape (see `synth.roofline.roofline_hint`); it steers the open
     algorithm search toward the bandwidth-favourable gradient form.
+
+    `analyst_notes` is an optional bounded list of advisory one-line summaries of
+    why recent candidates failed (see `synth.analyst`); the newest `max_notes`
+    are surfaced to the Director. Advisory only — never affects the gate.
     """
     ranked_baselines = sorted(
         ((name, t) for name, t in baseline_times.items()),
@@ -102,6 +153,8 @@ def build_research_state(
     }
     if cost_model is not None:
         state["hardware_cost_model"] = cost_model
+    if analyst_notes:
+        state["analyst_notes"] = list(analyst_notes)[-max_notes:]
     return state
 
 
