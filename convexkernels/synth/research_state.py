@@ -21,8 +21,20 @@ from typing import Optional
 
 
 def _idea_key(row: dict) -> str:
+    """Coarse dedup signature for a tried direction.
+
+    Keys on the proposer's `algorithm_family` tag. `edit.type` is always
+    "full_source" in the open-search loop, so keying on it collapsed the entire
+    discard history into one bucket and starved the proposer of negative signal.
+    Falls back to a normalized rationale prefix for older/untagged rows.
+    """
     edit = row.get("edit") or {}
-    # Dedup on a coarse signature: the proposer's algorithm-family/type tag.
+    fam = str(edit.get("algorithm_family") or "").strip().lower()
+    if fam:
+        return fam
+    rationale = " ".join(str(edit.get("rationale") or "").lower().split())
+    if rationale:
+        return rationale[:48]
     return str(edit.get("type") or "other").strip().lower()
 
 
