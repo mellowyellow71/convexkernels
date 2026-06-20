@@ -19,9 +19,10 @@ their time-to-target is one-to-two orders of magnitude below the generic conic
 panel, so omitting them lets a candidate "beat the baselines" while being far
 slower than a trivial fast-LASSO call. These are optional deps (`.[baselines]`);
 a missing one degrades to an empty curve (time_to_kkt = inf), never a crash.
-For a path, adelie is run as a single native multi-lambda `grpnet` solve
-(screening + warm-start across the path — its actual advantage), not K
-independent column solves.
+For a path, both fast-LASSO baselines use their native warm-started path solve —
+adelie a single multi-lambda `grpnet`, sklearn a single `lasso_path` (coordinate
+descent warm-started down the decreasing-lambda grid) — not K independent
+cold per-column solves, which understated the fast-LASSO bar.
 
 For a `LassoPath`, the path is scored as a whole: at iteration budget `N`, each
 column is solved (as a single LASSO) at cap `N`, the per-column solve times are
@@ -136,6 +137,36 @@ def _sklearn_lasso_coef(prob: Lasso, cap: int) -> tuple[Optional[np.ndarray], fl
     return np.asarray(model.coef_), time.perf_counter() - t0
 
 
+def _sklearn_path_coefs(problem: LassoPath, cap: int) -> tuple[Optional[np.ndarray], float]:
+    """One warm-started `lasso_path` solve over the whole lambda path.
+
+    This is sklearn's actual fast-path solver: coordinate descent that
+    warm-starts each lambda from the previous (decreasing) lambda's solution —
+    the same edge Adelie's native path solve has. Scoring the path with K cold
+    per-column fits understated the fast-LASSO bar; this restores it.
+    """
+    import warnings
+
+    from sklearn.linear_model import lasso_path
+
+    # `problem.lambdas` are decreasing (glmnet convention); alpha = lam / m.
+    # lasso_path warm-starts down a descending alpha grid and returns
+    # coefs (n_features, n_alphas) aligned to that same descending order.
+    alphas = np.asarray(problem.lambdas, dtype=float) / problem.m
+    t0 = time.perf_counter()
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")  # capped path warns on non-convergence
+        _, coefs, _ = lasso_path(
+            problem.A, problem.b, alphas=alphas,
+            max_iter=int(cap), tol=1e-14,
+        )
+    wall = time.perf_counter() - t0
+    X = np.asarray(coefs)
+    if X.shape != (problem.n, problem.K):
+        return None, wall
+    return X, wall
+
+
 def _sklearn_curve(problem, sweep: Sequence[int]) -> list[tuple[float, float]]:
     try:
         import sklearn  # noqa: F401
@@ -144,14 +175,10 @@ def _sklearn_curve(problem, sweep: Sequence[int]) -> list[tuple[float, float]]:
     pts: list[tuple[float, float]] = []
     if isinstance(problem, LassoPath):
         for cap in sweep:
-            X = np.zeros((problem.n, problem.K))
-            total_t = 0.0
-            for k in range(problem.K):
-                col = Lasso(problem.A, problem.b, float(problem.lambdas[k]))
-                x, wall = _sklearn_lasso_coef(col, cap)
-                total_t += wall
-                X[:, k] = x
-            pts.append((total_t, trusted_kkt(problem, X)))
+            X, wall = _sklearn_path_coefs(problem, cap)
+            if X is None:
+                continue
+            pts.append((wall, trusted_kkt(problem, X)))
     else:
         for cap in sweep:
             x, wall = _sklearn_lasso_coef(problem, cap)

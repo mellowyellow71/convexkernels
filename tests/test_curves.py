@@ -143,3 +143,39 @@ def test_fast_lasso_beats_conic_panel_on_small_lasso():
     t_clarabel = time_to_kkt(panel["CLARABEL"], 1e-4)
     assert math.isfinite(t_sklearn)
     assert t_sklearn < t_clarabel
+
+
+def test_sklearn_path_curve_warmstarted_beats_per_column():
+    # The warm-started lasso_path bar must be at least as tight as K cold
+    # per-column fits — that is the point of A2 (don't understate the bar).
+    import time
+    import warnings as _w
+    from sklearn.linear_model import Lasso as SkLasso
+    from convexkernels.bench.metrics import trusted_kkt
+
+    path = _small_path(m=120, n=40, K=8)
+    sweep = (5, 50, 400, 1600)
+
+    warm = baseline_kkt_time_curve(path, "sklearn", sweep=sweep)
+    assert len(warm) >= 2
+    assert all(math.isfinite(k) and t >= 0.0 for t, k in warm)
+
+    # explicit per-column reconstruction (the old behaviour)
+    def per_column(cap):
+        X = np.zeros((path.n, path.K)); tt = 0.0
+        for k in range(path.K):
+            mdl = SkLasso(alpha=path.lambdas[k] / path.m, fit_intercept=False,
+                          max_iter=int(cap), tol=1e-14, selection="cyclic")
+            t0 = time.perf_counter()
+            with _w.catch_warnings():
+                _w.simplefilter("ignore"); mdl.fit(path.A, path.b)
+            tt += time.perf_counter() - t0; X[:, k] = mdl.coef_
+        return tt, trusted_kkt(path, X)
+    old = sorted(per_column(c) for c in sweep)
+
+    tol = 1e-6
+    t_warm = time_to_kkt(warm, tol)
+    t_old = time_to_kkt(old, tol)
+    assert math.isfinite(t_warm)
+    # warm-started reaches the target no later than the per-column bar
+    assert t_warm <= t_old * 1.05
