@@ -49,11 +49,18 @@ class Edit:
     full_source: str = ""
     proposer_role: str = "impl"
     proposer_model: str = ""
+    # Coarse algorithm-family tag (e.g. "fista_gram", "admm", "coordinate_descent").
+    # `type` is always "full_source", so the curated-history dedup keys on this
+    # instead — otherwise every discarded direction collapses into one bucket.
+    algorithm_family: str = ""
 
     def _to_lineage_edit(self) -> _LineageEdit:
         return _LineageEdit(
             type=self.type,
-            payload={"full_source_bytes": len(self.full_source)},
+            payload={
+                "full_source_bytes": len(self.full_source),
+                "algorithm_family": self.algorithm_family,
+            },
             rationale=self.rationale,
             proposer_role=self.proposer_role,  # type: ignore[arg-type]
             proposer_model=self.proposer_model,
@@ -450,7 +457,7 @@ def run_synth_loop(
             _record(LineageRow(
                 id=_new_id(), parent_id=parent_id, generation=len(appended) + 1,
                 created_at=_now_iso(), slot=_slot_to_dict(slot),
-                edit={"type": edit.type, "rationale": edit.rationale, "proposer_role": edit.proposer_role},
+                edit={"type": edit.type, "rationale": edit.rationale, "proposer_role": edit.proposer_role, "algorithm_family": edit.algorithm_family},
                 source={"path": "", "hash": ""}, score=None,
                 decision={"accepted": False, "reason": "discard:empty_source"},
             ))
@@ -461,7 +468,7 @@ def run_synth_loop(
             _record(LineageRow(
                 id=_new_id(), parent_id=parent_id, generation=len(appended) + 1,
                 created_at=_now_iso(), slot=_slot_to_dict(slot),
-                edit={"type": edit.type, "rationale": edit.rationale, "proposer_role": edit.proposer_role},
+                edit={"type": edit.type, "rationale": edit.rationale, "proposer_role": edit.proposer_role, "algorithm_family": edit.algorithm_family},
                 source={"path": "", "hash": source_hash}, score=None,
                 decision={"accepted": False, "reason": "discard:duplicate_source"},
             ))
@@ -491,7 +498,7 @@ def run_synth_loop(
             _record(LineageRow(
                 id=run_id, parent_id=parent_id, generation=len(appended) + 1,
                 created_at=_now_iso(), slot=_slot_to_dict(slot),
-                edit={"type": edit.type, "rationale": edit.rationale, "proposer_role": edit.proposer_role},
+                edit={"type": edit.type, "rationale": edit.rationale, "proposer_role": edit.proposer_role, "algorithm_family": edit.algorithm_family},
                 source={"path": str(candidate_path), "hash": source_hash}, score=None,
                 decision={"accepted": False, "reason": f"crash:{cand_err}"},
             ))

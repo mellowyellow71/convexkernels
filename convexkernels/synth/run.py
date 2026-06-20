@@ -126,7 +126,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--slot", required=True, help="problem_family/hardware (e.g. lasso_path/apple_silicon)")
     p.add_argument("--shape", required=True, help="bench shape name (e.g. path_tall_medium)")
     p.add_argument("--seed", default=None, help="seed kernel module dotted-path (auto if omitted)")
-    p.add_argument("--proposer", choices=["openai", "stub"], default="openai")
+    p.add_argument("--proposer", choices=["openai", "stub", "mutation"], default="openai")
     p.add_argument("--model", default="gpt-5.5", help="OpenAI model name")
     p.add_argument("--reasoning-effort", default="medium")
     p.add_argument("--api-timeout-s", type=float, default=240.0)
@@ -186,6 +186,9 @@ def main(argv: list[str] | None = None) -> int:
             reasoning_effort=args.reasoning_effort,
             api_timeout_s=args.api_timeout_s,
         )
+    elif args.proposer == "mutation":
+        from .proposers.mutation import MutationProposer
+        proposer = MutationProposer()
     else:
         proposer = StubProposer([])
 
