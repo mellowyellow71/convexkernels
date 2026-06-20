@@ -149,6 +149,15 @@ def main(argv: list[str] | None = None) -> int:
                    help="path to a cached Adelie .npz to inject as the bar-to-beat "
                         "('auto' = convexkernels/bench/cache/adelie_path_<shape>.npz; "
                         "'none' to disable)")
+    p.add_argument("--director", choices=["openai", "stub", "off"], default="off",
+                   help="strategist that picks branch point + direction; 'off'/'stub' "
+                        "= greedy-from-champion (today's behavior)")
+    p.add_argument("--director-model", default="gpt-5.5")
+    p.add_argument("--director-reasoning-effort", default="medium")
+    p.add_argument("--director-every-k", type=int, default=1,
+                   help="call the director every K proposals (cost control)")
+    p.add_argument("--analyst", choices=["openai", "off"], default="off",
+                   help="advisory LLM that explains failures to the director (never gates)")
     p.add_argument("--verbose", action="store_true", default=True)
     args = p.parse_args(argv)
 
@@ -189,6 +198,24 @@ def main(argv: list[str] | None = None) -> int:
     else:
         proposer = StubProposer([])
 
+    # Strategy layer (default off == greedy-from-champion, today's behavior).
+    if args.director == "openai":
+        from .director import OpenAIDirector
+        director = OpenAIDirector(
+            model=args.director_model,
+            reasoning_effort=args.director_reasoning_effort,
+            api_timeout_s=args.api_timeout_s,
+        )
+    else:
+        from .director import StubDirector
+        director = StubDirector()
+    if args.analyst == "openai":
+        from .analyst import OpenAIAnalyst
+        analyst = OpenAIAnalyst(api_timeout_s=args.api_timeout_s)
+    else:
+        from .analyst import StubAnalyst
+        analyst = StubAnalyst()
+
     rows = run_synth_loop(
         proposer=proposer,
         problem=problem,
@@ -210,6 +237,9 @@ def main(argv: list[str] | None = None) -> int:
         compute_baselines=not args.no_baselines,
         baseline_solvers=tuple(s.strip() for s in args.baseline_solvers.split(",") if s.strip()),
         extra_baseline_curves=extra_baseline_curves,
+        director=director,
+        analyst=analyst,
+        director_every_k=args.director_every_k,
         verbose=args.verbose,
     )
 
