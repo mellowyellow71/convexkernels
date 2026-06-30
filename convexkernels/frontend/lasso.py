@@ -66,3 +66,8 @@ class Lasso(Problem):
         return lasso_kkt_residual(
             self.A, self.b, self.lam, x, L=self.L, lambda_max=self.lambda_max
         )
+
+    def duality_gap(self, x: np.ndarray) -> float:
+        """Oracle-free LASSO duality gap (scale-free); 0 iff x is optimal."""
+        from ..algorithms.gap import lasso_duality_gap
+        return lasso_duality_gap(self.A, self.b, self.lam, x)
