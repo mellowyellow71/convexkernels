@@ -76,8 +76,15 @@ def write_eval_config(
     warmup_runs: int = 0,
     kkt_tol: float = 1e-6,
     max_time_s: float = 60.0,
+    score_metric: str = "kkt",
 ) -> Path:
-    """Pickle the problem and write the eval config to `run_dir`."""
+    """Pickle the problem and write the eval config to `run_dir`.
+
+    `score_metric` selects the optimality ruler the recorder samples: ``kkt``
+    (the KKT residual, default) or ``gap`` (the oracle-free duality gap — the
+    y-axis for the two-objective Pareto loop). Both are scale-free and vanish
+    only at the optimum, so the gate (``<= kkt_tol``) is unchanged in meaning.
+    """
     run_dir.mkdir(parents=True, exist_ok=True)
     problem_path = run_dir / "problem.pkl"
     with problem_path.open("wb") as f:
@@ -92,6 +99,7 @@ def write_eval_config(
         "warmup_runs": warmup_runs,
         "kkt_tol": kkt_tol,
         "max_time_s": max_time_s,
+        "score_metric": score_metric,
         "problem_pickle_path": str(problem_path),
     }
     config_path = run_dir / "eval_config.json"

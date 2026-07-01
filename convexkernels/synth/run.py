@@ -126,7 +126,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--slot", required=True, help="problem_family/hardware (e.g. lasso_path/apple_silicon)")
     p.add_argument("--shape", required=True, help="bench shape name (e.g. path_tall_medium)")
     p.add_argument("--seed", default=None, help="seed kernel module dotted-path (auto if omitted)")
-    p.add_argument("--proposer", choices=["openai", "stub"], default="openai")
+    p.add_argument("--proposer", choices=["openai", "stub", "algopool"], default="openai")
     p.add_argument("--model", default="gpt-5.5", help="OpenAI model name")
     p.add_argument("--reasoning-effort", default="medium")
     p.add_argument("--api-timeout-s", type=float, default=240.0)
@@ -135,6 +135,10 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--kkt-tol", type=float, default=1e-6, help="trusted KKT target")
     p.add_argument("--max-time-s", type=float, default=60.0, help="per-solve wall budget")
     p.add_argument("--margin", type=float, default=0.97, help="must be this much faster than champion")
+    p.add_argument("--selection", choices=["champion", "pareto"], default="champion",
+                   help="champion: keep the single fastest-to-tolerance solver (KKT ruler); "
+                        "pareto: keep every candidate that extends the (wall-time, duality-gap) "
+                        "frontier, rewarded by dominated hypervolume vs the baseline panel")
     p.add_argument("--problem-backend", choices=["native", "mlx"], default="mlx")
     p.add_argument("--problem-dtype", choices=["fp32", "fp16"], default="fp32")
     p.add_argument("--dtype-strategy", default="fp32")
@@ -186,6 +190,9 @@ def main(argv: list[str] | None = None) -> int:
             reasoning_effort=args.reasoning_effort,
             api_timeout_s=args.api_timeout_s,
         )
+    elif args.proposer == "algopool":
+        from .proposers.algopool import AlgoPoolProposer
+        proposer = AlgoPoolProposer()
     else:
         proposer = StubProposer([])
 
@@ -200,6 +207,7 @@ def main(argv: list[str] | None = None) -> int:
         max_time_s=args.max_time_s,
         reps=args.reps,
         margin=args.margin,
+        selection=args.selection,
         problem_backend=args.problem_backend,
         problem_dtype=args.problem_dtype,
         dtype_strategy=args.dtype_strategy,

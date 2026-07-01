@@ -23,6 +23,7 @@ from __future__ import annotations
 import hashlib
 import importlib.util
 import json
+import math
 import platform
 import statistics
 import uuid
@@ -32,7 +33,9 @@ from pathlib import Path
 from typing import Any, Optional, Protocol
 
 from ..bench.curves import baseline_panel, problem_hash, time_to_kkt
+from ..bench.metrics import trusted_gap, trusted_kkt
 from .checkpoints import CheckpointStore
+from .pareto_archive import ParetoArchive
 from .lineage import Edit as _LineageEdit
 from .lineage import Slot
 from .research_state import build_research_state, write_research_state
@@ -157,6 +160,7 @@ def _evaluate(
     dtype_strategy: str,
     warmup_runs: int,
     timeout_s: float,
+    score_metric: str = "kkt",
 ) -> tuple[Optional[EvalScore], Optional[str]]:
     """Run the candidate `reps` times and aggregate time-to-target."""
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -180,6 +184,7 @@ def _evaluate(
             warmup_runs=warmup_runs,
             kkt_tol=kkt_tol,
             max_time_s=max_time_s,
+            score_metric=score_metric,
         )
         result = run_kernel(rep_dir, timeout_s=timeout_s)
         if result.status != "completed":
@@ -208,6 +213,21 @@ def _evaluate(
 
 
 # ---------- gating ----------
+
+
+def _score_curve(score: EvalScore) -> list[tuple[float, float]]:
+    """The candidate's anytime (total_wall_time_s, gap) curve for the Pareto archive.
+
+    The recorder timestamps exclude setup, so each trajectory point is offset by
+    the measured setup time to give the true wall-clock-to-reach-this-gap; the
+    final (total_time_s, gap_final) point is appended."""
+    setup = float(score.setup_s or 0.0)
+    pts: list[tuple[float, float]] = [
+        (setup + float(t), float(g)) for t, g in (score.trajectory or [])
+    ]
+    if math.isfinite(score.total_time_s) and math.isfinite(score.kkt_final):
+        pts.append((float(score.total_time_s), float(score.kkt_final)))
+    return pts
 
 
 def _decide(
@@ -274,6 +294,7 @@ def run_synth_loop(
     max_time_s: float = 60.0,
     reps: int = 3,
     margin: float = 0.97,
+    selection: str = "champion",
     problem_backend: str = "mlx",
     problem_dtype: str = "fp32",
     dtype_strategy: str = "fp32",
@@ -302,6 +323,14 @@ def run_synth_loop(
     store = CheckpointStore(state_root)
     phash = problem_hash(problem)
 
+    # Selection mode: "champion" = single fastest-to-fixed-tolerance incumbent
+    # (KKT ruler); "pareto" = maintain the (wall-time, duality-gap) Pareto
+    # frontier, keep a candidate iff its anytime curve adds dominated
+    # hypervolume, and reward proposals by hypervolume gained over the panel.
+    score_metric = "gap" if selection == "pareto" else "kkt"
+    metric_fn = trusted_gap if score_metric == "gap" else trusted_kkt
+    archive: Optional[ParetoArchive] = None
+
     # ---- baseline panel: the bar to beat ----
     baseline_times: dict[str, float] = {}
     panel: dict[str, list] = {}
@@ -310,6 +339,7 @@ def run_synth_loop(
             panel = baseline_panel(
                 problem, solvers=baseline_solvers,
                 cache_dir=state_root / "baselines",
+                metric=metric_fn, metric_tag=score_metric,
             )
         except Exception as exc:  # noqa: BLE001
             if verbose:
@@ -362,6 +392,7 @@ def run_synth_loop(
         dtype_strategy=dtype_strategy,
         warmup_runs=warmup_runs,
         timeout_s=timeout_s,
+        score_metric=score_metric,
     )
     if base_score is None or not base_score.reached_target:
         raise RuntimeError(f"seed did not reach target: err={base_err} score={base_score}")
@@ -371,6 +402,11 @@ def run_synth_loop(
               f"kkt={base_score.kkt_final:.2e}")
 
     current_score = base_score
+
+    # Seed the Pareto frontier with the starting champion's anytime curve.
+    if selection == "pareto":
+        archive = ParetoArchive(baselines=panel)
+        archive.seed(_score_curve(base_score))
 
     # Root the experiment tree: the seed itself is a durable checkpoint node.
     if resume_from is None:
@@ -411,6 +447,12 @@ def run_synth_loop(
             kkt_tol=kkt_tol,
             cost_model=cost_model_hint,
         )
+        if archive is not None:
+            # The two-objective reward context: the current (time, gap) frontier
+            # and how much room is left over the baseline panel. The proposer is
+            # rewarded for adding dominated hypervolume here.
+            state["selection"] = "pareto"
+            state["pareto"] = archive.summary()
         write_research_state(state_root / "research_state.json", state)
         return state
 
@@ -485,6 +527,7 @@ def run_synth_loop(
             dtype_strategy=dtype_strategy,
             warmup_runs=warmup_runs,
             timeout_s=timeout_s,
+            score_metric=score_metric,
         )
 
         if cand_score is None:
@@ -499,7 +542,22 @@ def run_synth_loop(
                 print(f"[synth] {i+1}/{n_proposals}: crash {cand_err}")
             continue
 
-        kept, reason = _decide(cand_score, current_score, kkt_tol, margin, best_baseline)
+        if archive is not None:
+            cand_curve = _score_curve(cand_score)
+            res = archive.consider(cand_curve)
+            kept = bool(res["accepted"])
+            adv = res["advantage_over_archive"]
+            panel_tag = ""
+            if res["advantage_vs_panel"] is not None:
+                panel_tag = f";vs_panel={res['advantage_vs_panel']:+.3g}"
+            reason = (
+                f"keep:adds_frontier_hv({adv:.3g}){panel_tag}" if kept
+                else f"discard:pareto_dominated(adv={adv:.3g}){panel_tag}"
+            )
+            if kept:
+                archive.accept(cand_curve)
+        else:
+            kept, reason = _decide(cand_score, current_score, kkt_tol, margin, best_baseline)
         row = LineageRow(
             id=run_id, parent_id=parent_id, generation=len(appended) + 1,
             created_at=_now_iso(), slot=_slot_to_dict(slot),

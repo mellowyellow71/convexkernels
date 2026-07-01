@@ -200,3 +200,12 @@ class LassoPath:
     def kkt_residual_max(self, X: np.ndarray) -> float:
         """Convenience: scalar max-over-columns of the per-column residual."""
         return float(np.max(self.kkt_residual(X)))
+
+    def duality_gap_per_col(self, X: np.ndarray) -> np.ndarray:
+        """Per-column oracle-free LASSO duality gap; shape (K,)."""
+        from ..algorithms.gap import lasso_duality_gap_batched
+        return lasso_duality_gap_batched(self.A, self.b, self.lambdas, X)
+
+    def duality_gap_max(self, X: np.ndarray) -> float:
+        """Scalar max-over-columns duality gap (the path optimality gap)."""
+        return float(np.max(self.duality_gap_per_col(X)))
