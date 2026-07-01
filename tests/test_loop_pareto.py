@@ -81,8 +81,12 @@ def small_lasso():
 
 def test_pareto_selection_end_to_end(small_lasso, tmp_path):
     slot = Slot(problem_family="lasso", algorithm="open", hardware="cpu", dtype="open")
+    # (1, True) records every iteration: its first curve point lands ~10x
+    # earlier than the seed's (check_every=10), so it owns the fast-loose
+    # region and must be kept even now that every candidate traces to the
+    # machine floor (post trace-tol, near-identical variants add nothing).
     rows = run_synth_loop(
-        proposer=_InlineProposer([(5, True), (50, True), (5, True)]),
+        proposer=_InlineProposer([(1, True), (50, True), (1, True)]),
         problem=small_lasso,
         seed_kernel={"module": "convexkernels.kernels.numpy_solve_ref"},
         slot=slot,
@@ -113,6 +117,34 @@ def test_pareto_selection_end_to_end(small_lasso, tmp_path):
     assert pareto["hypervolume"] > 0.0
     assert len(pareto["frontier"]) >= 1
     assert pareto["frontier_best_gap"] is not None
+
+
+def test_pareto_traces_past_reporting_tolerance(small_lasso, tmp_path):
+    # In pareto mode the solver gets a near-machine-floor trace tolerance, so
+    # its curve runs far below the reporting kkt_tol instead of stopping there
+    # (stopping at tol cedes the deep-tight region of the plane for no reason).
+    slot = Slot(problem_family="lasso", algorithm="open", hardware="cpu", dtype="open")
+    rows = run_synth_loop(
+        proposer=_InlineProposer([(5, True)]),
+        problem=small_lasso,
+        seed_kernel={"module": "convexkernels.kernels.numpy_solve_ref"},
+        slot=slot,
+        state_root=tmp_path,
+        n_proposals=1,
+        reps=1,
+        kkt_tol=1e-6,
+        max_time_s=5.0,
+        selection="pareto",
+        problem_backend="native",
+        compute_baselines=False,
+        verbose=False,
+    )
+    score = rows[0].score
+    assert score is not None
+    # the candidate kept iterating well past the 1e-6 reporting target
+    assert score["kkt_final"] < 1e-10
+    # while reached/time-to-target are still judged against kkt_tol
+    assert score["reached_target"] is True
 
 
 def test_champion_selection_unchanged(small_lasso, tmp_path):

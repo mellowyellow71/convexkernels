@@ -117,6 +117,9 @@ def main(run_dir: str) -> int:
             trusted_problem = pickle.load(f)  # canonical numpy frontend problem
 
         kkt_tol = float(config.get("kkt_tol", config.get("tol", 1e-6)))
+        # The candidate's stop tolerance may be decoupled from the reporting
+        # tolerance (Pareto mode traces curves to a near-machine floor).
+        solve_tol = float(config.get("solve_tol") or kkt_tol)
         max_time_s = float(config.get("max_time_s", 60.0))
         solve_name = config.get("kernel_solve", "solve")
 
@@ -149,12 +152,12 @@ def main(run_dir: str) -> int:
         # ---- warmups (discarded) ----
         for _ in range(int(config.get("warmup_runs", 0))):
             w = Recorder(kkt_fn, max_time_s=max_time_s)
-            solve(prob, w, kkt_tol=kkt_tol, max_time_s=max_time_s)
+            solve(prob, w, kkt_tol=solve_tol, max_time_s=max_time_s)
 
         # ---- timed solve ----
         rec = Recorder(kkt_fn, max_time_s=max_time_s)
         solve_t0 = perf_counter()
-        X = solve(prob, rec, kkt_tol=kkt_tol, max_time_s=max_time_s)
+        X = solve(prob, rec, kkt_tol=solve_tol, max_time_s=max_time_s)
         solve_time_s = perf_counter() - solve_t0
 
         # ---- trusted final verification (anti-gaming gate) ----
