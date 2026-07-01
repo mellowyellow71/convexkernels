@@ -223,6 +223,21 @@ def _format_prompt(ctx: dict) -> str:
         for lever in cm.get("levers") or []:
             sections.append("  lever: " + str(lever))
 
+    pareto = state.get("pareto") or {}
+    if pareto:
+        sections.append("--- pareto frontier (two-objective mode) ---")
+        front = pareto.get("frontier") or []
+        pts = ", ".join(f"({t:.4g}s, {g:.1e})" for t, g in front[:16])
+        sections.append(
+            "Current (wall_time_s, duality_gap) frontier we hold: [{}]\n"
+            "frontier hypervolume={:.4g}; best gap={}; fastest point={}s".format(
+                pts,
+                pareto.get("hypervolume", 0.0),
+                pareto.get("frontier_best_gap"),
+                pareto.get("frontier_fastest_time"),
+            )
+        )
+
     tried = state.get("tried_directions") or []
     sections.append("--- tried directions (curated; don't repeat failures) ---")
     if tried:
@@ -232,14 +247,27 @@ def _format_prompt(ctx: dict) -> str:
         sections.append("(none yet — first proposal)")
 
     sections.append("--- target metric ---")
-    sections.append(
-        "Reach trusted KKT < {tol:.1e} (the hard correctness gate). Your "
-        "total_time_s (setup + time_to_kkt) must be < {margin} * the champion's "
-        "(i.e. ≥{pct:.1f}% faster) to be kept. Beating the baseline bar above is "
-        "the real goal.".format(
-            tol=kkt_tol, margin=margin, pct=(1.0 - margin) * 100,
+    if pareto:
+        sections.append(
+            "TWO-OBJECTIVE MODE: solvers are judged on the (wall-clock, duality-gap) "
+            "plane. Your candidate's anytime curve is KEPT iff it is Pareto "
+            "non-dominated — i.e. for SOME region of the plane it is strictly the "
+            "best we have (faster at a given gap, or tighter at a given time). "
+            "Reward = dominated hypervolume added over the frontier above and over "
+            "the classical baseline panel. Both extremes are valuable: an "
+            "aggressively fast low-accuracy solver AND a slow ultra-tight one. "
+            "Do not aim only at gap<{tol:.1e}; aim to claim plane-area the "
+            "baselines hold.".format(tol=kkt_tol)
         )
-    )
+    else:
+        sections.append(
+            "Reach trusted KKT < {tol:.1e} (the hard correctness gate). Your "
+            "total_time_s (setup + time_to_kkt) must be < {margin} * the champion's "
+            "(i.e. ≥{pct:.1f}% faster) to be kept. Beating the baseline bar above is "
+            "the real goal.".format(
+                tol=kkt_tol, margin=margin, pct=(1.0 - margin) * 100,
+            )
+        )
 
     sections.append("--- output ---")
     sections.append(
