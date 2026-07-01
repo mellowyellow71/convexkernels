@@ -135,6 +135,10 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--kkt-tol", type=float, default=1e-6, help="trusted KKT target")
     p.add_argument("--max-time-s", type=float, default=60.0, help="per-solve wall budget")
     p.add_argument("--margin", type=float, default=0.97, help="must be this much faster than champion")
+    p.add_argument("--selection", choices=["champion", "pareto"], default="champion",
+                   help="champion: keep the single fastest-to-tolerance solver (KKT ruler); "
+                        "pareto: keep every candidate that extends the (wall-time, duality-gap) "
+                        "frontier, rewarded by dominated hypervolume vs the baseline panel")
     p.add_argument("--problem-backend", choices=["native", "mlx"], default="mlx")
     p.add_argument("--problem-dtype", choices=["fp32", "fp16"], default="fp32")
     p.add_argument("--dtype-strategy", default="fp32")
@@ -200,6 +204,7 @@ def main(argv: list[str] | None = None) -> int:
         max_time_s=args.max_time_s,
         reps=args.reps,
         margin=args.margin,
+        selection=args.selection,
         problem_backend=args.problem_backend,
         problem_dtype=args.problem_dtype,
         dtype_strategy=args.dtype_strategy,

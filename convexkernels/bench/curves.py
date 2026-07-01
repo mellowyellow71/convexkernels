@@ -72,19 +72,19 @@ def problem_hash(problem) -> str:
     return h.hexdigest()[:16]
 
 
-def _single_curve(prob: Lasso, solver: str, sweep: Sequence[int]) -> list[tuple[float, float]]:
+def _single_curve(prob: Lasso, solver: str, sweep: Sequence[int], metric=trusted_kkt) -> list[tuple[float, float]]:
     cvxprob, x_var = build_cvxpy_lasso(prob)  # canonicalize once, sweep on it
     pts: list[tuple[float, float]] = []
     for cap in sweep:
         x, wall = solve_existing_cvxpy(cvxprob, x_var, solver, max_iter=int(cap))
         if x is None:
             continue
-        pts.append((wall, trusted_kkt(prob, x)))
+        pts.append((wall, metric(prob, x)))
     pts.sort(key=lambda p: p[0])
     return pts
 
 
-def _path_curve(prob: LassoPath, solver: str, sweep: Sequence[int]) -> list[tuple[float, float]]:
+def _path_curve(prob: LassoPath, solver: str, sweep: Sequence[int], metric=trusted_kkt) -> list[tuple[float, float]]:
     # Build one reusable cvxpy problem per column (canonicalized once each).
     cols = []
     for k in range(prob.K):
@@ -105,7 +105,7 @@ def _path_curve(prob: LassoPath, solver: str, sweep: Sequence[int]) -> list[tupl
             total_t += wall
             if x is not None:
                 X[:, k] = x
-        pts.append((total_t, trusted_kkt(prob, X)))
+        pts.append((total_t, metric(prob, X)))
     pts.sort(key=lambda p: p[0])
     return pts
 
@@ -136,7 +136,7 @@ def _sklearn_lasso_coef(prob: Lasso, cap: int) -> tuple[Optional[np.ndarray], fl
     return np.asarray(model.coef_), time.perf_counter() - t0
 
 
-def _sklearn_curve(problem, sweep: Sequence[int]) -> list[tuple[float, float]]:
+def _sklearn_curve(problem, sweep: Sequence[int], metric=trusted_kkt) -> list[tuple[float, float]]:
     try:
         import sklearn  # noqa: F401
     except Exception:  # noqa: BLE001 — optional dep absent
@@ -151,16 +151,16 @@ def _sklearn_curve(problem, sweep: Sequence[int]) -> list[tuple[float, float]]:
                 x, wall = _sklearn_lasso_coef(col, cap)
                 total_t += wall
                 X[:, k] = x
-            pts.append((total_t, trusted_kkt(problem, X)))
+            pts.append((total_t, metric(problem, X)))
     else:
         for cap in sweep:
             x, wall = _sklearn_lasso_coef(problem, cap)
-            pts.append((wall, trusted_kkt(problem, x)))
+            pts.append((wall, metric(problem, x)))
     pts.sort(key=lambda p: p[0])
     return pts
 
 
-def _adelie_curve(problem, sweep: Sequence[int]) -> list[tuple[float, float]]:
+def _adelie_curve(problem, sweep: Sequence[int], metric=trusted_kkt) -> list[tuple[float, float]]:
     """adelie grpnet anytime curve.
 
     For a path, adelie solves *all* lambdas in one `grpnet` call (screening +
@@ -190,7 +190,7 @@ def _adelie_curve(problem, sweep: Sequence[int]) -> list[tuple[float, float]]:
             betas = np.asarray(state.betas.toarray())  # (K, n)
             if betas.shape != (problem.K, problem.n):
                 continue
-            pts.append((wall, trusted_kkt(problem, betas.T)))
+            pts.append((wall, metric(problem, betas.T)))
     else:
         A_f = np.asfortranarray(problem.A)
         for cap in sweep:
@@ -211,23 +211,27 @@ def _adelie_curve(problem, sweep: Sequence[int]) -> list[tuple[float, float]]:
             if betas.shape != (1, problem.n):
                 continue
             x = betas[-1]
-            pts.append((wall, trusted_kkt(problem, x)))
+            pts.append((wall, metric(problem, x)))
     pts.sort(key=lambda p: p[0])
     return pts
 
 
 def baseline_kkt_time_curve(
-    problem, solver: str, sweep: Optional[Sequence[int]] = None,
+    problem, solver: str, sweep: Optional[Sequence[int]] = None, metric=trusted_kkt,
 ) -> list[tuple[float, float]]:
-    """Trace `(wall_time_s, kkt)` for `solver` on `problem` across a cap sweep."""
+    """Trace `(wall_time_s, metric)` for `solver` on `problem` across a cap sweep.
+
+    `metric(problem, x)` is the optimality ruler — `trusted_kkt` (default) or
+    `trusted_gap` for the two-objective Pareto loop.
+    """
     sweep = tuple(sweep) if sweep is not None else DEFAULT_SWEEP
     if solver == "sklearn":
-        return _sklearn_curve(problem, sweep)
+        return _sklearn_curve(problem, sweep, metric)
     if solver == "adelie":
-        return _adelie_curve(problem, sweep)
+        return _adelie_curve(problem, sweep, metric)
     if isinstance(problem, LassoPath):
-        return _path_curve(problem, solver, sweep)
-    return _single_curve(problem, solver, sweep)
+        return _path_curve(problem, solver, sweep, metric)
+    return _single_curve(problem, solver, sweep, metric)
 
 
 def time_to_kkt(curve: Sequence[Sequence[float]], tol: float) -> float:
@@ -241,17 +245,25 @@ def baseline_panel(
     solvers: Sequence[str] = DEFAULT_PANEL_SOLVERS,
     sweep: Optional[Sequence[int]] = None,
     cache_dir: Optional[Path] = None,
+    metric=trusted_kkt,
+    metric_tag: str = "kkt",
 ) -> dict[str, list[tuple[float, float]]]:
-    """Curves for each solver, cached under `cache_dir/<hash>/<solver>.json`."""
+    """Curves for each solver, cached under `cache_dir/<hash>/<solver>[.<tag>].json`.
+
+    `metric`/`metric_tag` select the optimality ruler (default KKT residual;
+    `trusted_gap`/"gap" for the Pareto loop). The tag namespaces the cache so a
+    gap panel never reuses a cached KKT panel.
+    """
     out: dict[str, list[tuple[float, float]]] = {}
     phash = problem_hash(problem)
     cdir = Path(cache_dir) / phash if cache_dir is not None else None
+    suffix = "" if metric_tag == "kkt" else f".{metric_tag}"
     for solver in solvers:
-        cpath = (cdir / f"{solver}.json") if cdir is not None else None
+        cpath = (cdir / f"{solver}{suffix}.json") if cdir is not None else None
         if cpath is not None and cpath.exists():
             out[solver] = [tuple(p) for p in json.loads(cpath.read_text())]
             continue
-        curve = baseline_kkt_time_curve(problem, solver, sweep)
+        curve = baseline_kkt_time_curve(problem, solver, sweep, metric)
         out[solver] = curve
         # Don't cache an empty curve: it means an optional solver (adelie/sklearn)
         # was absent, and we want a later run with it installed to retry.

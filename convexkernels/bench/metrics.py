@@ -36,6 +36,22 @@ def trusted_kkt(problem, x) -> float:
     return float(np.max(np.abs(r_arr)))
 
 
+def trusted_gap(problem, x) -> float:
+    """Scalar oracle-free optimality gap of `x` for `problem` (max over columns).
+
+    Prefers the LASSO duality gap (the literal optimality gap Adelie/glmnet
+    report, so a candidate and the baselines are compared on the *same* y-axis);
+    falls back to the trusted KKT residual for problem types without a dual
+    helper. Like `trusted_kkt`, must be called on the canonical frontend problem.
+    """
+    x = np.asarray(x, dtype=np.float64)
+    if hasattr(problem, "duality_gap_max"):
+        return float(problem.duality_gap_max(x))
+    if hasattr(problem, "duality_gap"):
+        return float(problem.duality_gap(x))
+    return trusted_kkt(problem, x)
+
+
 def time_to_target(points: Iterable[Sequence[float]], tol: float) -> float:
     """First wall-clock time at which KKT <= `tol`, log-linearly interpolated.
 
