@@ -161,6 +161,7 @@ def _evaluate(
     warmup_runs: int,
     timeout_s: float,
     score_metric: str = "kkt",
+    solve_tol: Optional[float] = None,
 ) -> tuple[Optional[EvalScore], Optional[str]]:
     """Run the candidate `reps` times and aggregate time-to-target."""
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -185,6 +186,7 @@ def _evaluate(
             kkt_tol=kkt_tol,
             max_time_s=max_time_s,
             score_metric=score_metric,
+            solve_tol=solve_tol,
         )
         result = run_kernel(rep_dir, timeout_s=timeout_s)
         if result.status != "completed":
@@ -295,6 +297,7 @@ def run_synth_loop(
     reps: int = 3,
     margin: float = 0.97,
     selection: str = "champion",
+    pareto_trace_tol: float = 1e-14,
     problem_backend: str = "mlx",
     problem_dtype: str = "fp32",
     dtype_strategy: str = "fp32",
@@ -330,6 +333,12 @@ def run_synth_loop(
     score_metric = "gap" if selection == "pareto" else "kkt"
     metric_fn = trusted_gap if score_metric == "gap" else trusted_kkt
     archive: Optional[ParetoArchive] = None
+    # In pareto mode a candidate stopping at the reporting tolerance cedes the
+    # deep-tight region of the plane for no reason — every extra decade of gap
+    # it traces is potential frontier area. Hand the solver a near-machine-floor
+    # trace tolerance instead; the wall budget (max_time_s) remains the real
+    # stop. reached_target/time_to_kkt_s are still reported against kkt_tol.
+    solve_tol = min(kkt_tol, pareto_trace_tol) if selection == "pareto" else None
 
     # ---- baseline panel: the bar to beat ----
     baseline_times: dict[str, float] = {}
@@ -393,6 +402,7 @@ def run_synth_loop(
         warmup_runs=warmup_runs,
         timeout_s=timeout_s,
         score_metric=score_metric,
+        solve_tol=solve_tol,
     )
     if base_score is None or not base_score.reached_target:
         raise RuntimeError(f"seed did not reach target: err={base_err} score={base_score}")
@@ -528,6 +538,7 @@ def run_synth_loop(
             warmup_runs=warmup_runs,
             timeout_s=timeout_s,
             score_metric=score_metric,
+            solve_tol=solve_tol,
         )
 
         if cand_score is None:
