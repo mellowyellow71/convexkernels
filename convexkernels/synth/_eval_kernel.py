@@ -40,7 +40,7 @@ from time import perf_counter
 
 import numpy as np
 
-from convexkernels.bench.metrics import trusted_kkt
+from convexkernels.bench.metrics import trusted_gap, trusted_kkt
 from convexkernels.synth.recorder import Recorder
 
 
@@ -117,6 +117,9 @@ def main(run_dir: str) -> int:
             trusted_problem = pickle.load(f)  # canonical numpy frontend problem
 
         kkt_tol = float(config.get("kkt_tol", config.get("tol", 1e-6)))
+        # The candidate's stop tolerance may be decoupled from the reporting
+        # tolerance (Pareto mode traces curves to a near-machine floor).
+        solve_tol = float(config.get("solve_tol") or kkt_tol)
         max_time_s = float(config.get("max_time_s", 60.0))
         solve_name = config.get("kernel_solve", "solve")
 
@@ -143,22 +146,23 @@ def main(run_dir: str) -> int:
         setup_time_s = perf_counter() - setup_t0
 
         solve = getattr(kernel_module, solve_name)
-        kkt_fn = functools.partial(trusted_kkt, trusted_problem)
+        metric_fn = trusted_gap if config.get("score_metric") == "gap" else trusted_kkt
+        kkt_fn = functools.partial(metric_fn, trusted_problem)
 
         # ---- warmups (discarded) ----
         for _ in range(int(config.get("warmup_runs", 0))):
             w = Recorder(kkt_fn, max_time_s=max_time_s)
-            solve(prob, w, kkt_tol=kkt_tol, max_time_s=max_time_s)
+            solve(prob, w, kkt_tol=solve_tol, max_time_s=max_time_s)
 
         # ---- timed solve ----
         rec = Recorder(kkt_fn, max_time_s=max_time_s)
         solve_t0 = perf_counter()
-        X = solve(prob, rec, kkt_tol=kkt_tol, max_time_s=max_time_s)
+        X = solve(prob, rec, kkt_tol=solve_tol, max_time_s=max_time_s)
         solve_time_s = perf_counter() - solve_t0
 
         # ---- trusted final verification (anti-gaming gate) ----
         X_host = Recorder._materialize(X)
-        kkt_final = trusted_kkt(trusted_problem, X_host)
+        kkt_final = metric_fn(trusted_problem, X_host)
         np.save(run_path / "x.npy", X_host)
 
         trajectory = [[float(t), float(k)] for (t, k) in rec.trajectory]
