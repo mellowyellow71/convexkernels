@@ -153,6 +153,7 @@ def _format_prompt(ctx: dict) -> str:
     slot = ctx["slot"]
     score = ctx["current_score"]
     state = ctx.get("research_state") or {}
+    directive = ctx.get("directive") or {}
     traj = score.get("trajectory") or []
     program = (ctx.get("program_md") or "").strip()
     src_path = ctx.get("current_source_path") or "<unknown>"
@@ -243,6 +244,24 @@ def _format_prompt(ctx: dict) -> str:
             sections.append(json.dumps(t, default=str))
     else:
         sections.append("(none yet — first proposal)")
+
+    # Director directive (only when present and non-empty — the off/stub path
+    # produces no directive, so this block is absent and the prompt is identical
+    # to the pre-director loop).
+    if directive and str(directive.get("direction") or "").strip():
+        sections.append("--- director directive (a strategist chose this; follow it) ---")
+        sections.append(
+            "signal: {}\nbranch point: {}\npursue THIS direction: {}\n"
+            "target algorithm family: {}\nwhy: {}\n"
+            "The 'current source' above is the branch-point implementation to "
+            "rewrite for this direction; you must still beat the champion bar.".format(
+                directive.get("signal", "exploit"),
+                directive.get("branch_from", "champion"),
+                directive.get("direction", ""),
+                directive.get("algorithm_family_hint", ""),
+                directive.get("rationale", ""),
+            )
+        )
 
     sections.append("--- target metric ---")
     sections.append(
