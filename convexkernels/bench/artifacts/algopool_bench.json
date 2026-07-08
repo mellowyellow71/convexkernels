@@ -1,0 +1,62 @@
+{
+  "kkt_tol": 1e-06,
+  "max_time_s": 120.0,
+  "shapes": {
+    "path_tall_medium": {
+      "m": 5000,
+      "n": 2000,
+      "K": 50,
+      "results": {
+        "path_cd_screen": {
+          "reached": true,
+          "time_to_kkt_s": 2.6894,
+          "wall_s": 3.2996,
+          "kkt_final": 1.2558217457419433e-08,
+          "nnz": 3348
+        },
+        "path_fista_screen": {
+          "reached": true,
+          "time_to_kkt_s": 0.6518,
+          "wall_s": 0.6896,
+          "kkt_final": 2.9193388428047384e-11,
+          "nnz": 3348
+        },
+        "fista_path_baseline": {
+          "reached": true,
+          "time_to_kkt_s": 0.3815,
+          "wall_s": 0.4443,
+          "kkt_final": 2.532477389136499e-09,
+          "nnz": 3348
+        }
+      }
+    },
+    "path_wide_small": {
+      "m": 500,
+      "n": 2000,
+      "K": 50,
+      "results": {
+        "path_cd_screen": {
+          "reached": true,
+          "time_to_kkt_s": 4.9549,
+          "wall_s": 5.6724,
+          "kkt_final": 9.59475447860958e-07,
+          "nnz": 4933
+        },
+        "path_fista_screen": {
+          "reached": true,
+          "time_to_kkt_s": 4.8367,
+          "wall_s": 5.0737,
+          "kkt_final": 3.140375298336477e-07,
+          "nnz": 4933
+        },
+        "fista_path_baseline": {
+          "reached": true,
+          "time_to_kkt_s": 2.1491,
+          "wall_s": 2.2802,
+          "kkt_final": 7.944390446680811e-07,
+          "nnz": 4933
+        }
+      }
+    }
+  }
+}
