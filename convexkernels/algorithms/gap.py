@@ -32,7 +32,7 @@ def lasso_duality_gap(
     *,
     scale: float | None = None,
 ) -> float:
-    r"""Scale-free LASSO duality gap — the oracle-free optimality gap.
+    r"""Normalized LASSO duality gap — the oracle-free optimality gap.
 
     Primal:  P(x) = 1/2 ||A x - b||^2 + lam ||x||_1
     Dual:    D(theta) = 1/2 ||b||^2 - 1/2 ||b - theta||^2   s.t. ||A^T theta||_inf <= lam
@@ -45,8 +45,8 @@ def lasso_duality_gap(
     which is exactly why it can be the y-axis for a "beat Adelie" comparison.
 
     Returns ``(P - D) / scale`` with ``scale = 0.5 ||b||^2 + 1`` by default
-    (mirrors `tv_l2_primal_dual_gap`; scale-consistent up to alpha^2 under
-    ``(b, lam) -> (alpha b, alpha lam)``).
+    (mirrors `tv_l2_primal_dual_gap`; the +1 guards tiny ``b`` so this is a
+    normalization, not exact homogeneity under ``(b, lam) -> (alpha b, alpha lam)``).
     """
     A = np.asarray(A, dtype=np.float64)
     b = np.asarray(b, dtype=np.float64)

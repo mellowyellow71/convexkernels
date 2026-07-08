@@ -31,7 +31,7 @@ _GAP_FLOOR = 1e-16               # clip gap before log10 (gap==0 at the optimum)
 
 
 def _clean(points: Curve) -> list[tuple[float, float]]:
-    """Keep finite (time>=0, gap>0) points as (time, log10(gap))."""
+    """Finite (time>=0) points as (time, log10(gap)), gap clamped to a 1e-16 floor."""
     out: list[tuple[float, float]] = []
     for p in points:
         t, g = float(p[0]), float(p[1])
@@ -53,7 +53,7 @@ def _front(tl_points: list[tuple[float, float]]) -> list[tuple[float, float]]:
     front: list[tuple[float, float]] = []
     best_l = math.inf
     for t, l in pts:
-        if l < best_l - 0.0:
+        if l < best_l:
             front.append((t, l))
             best_l = l
     return front

@@ -37,19 +37,27 @@ def trusted_kkt(problem, x) -> float:
 
 
 def trusted_gap(problem, x) -> float:
-    """Scalar oracle-free optimality gap of `x` for `problem` (max over columns).
+    """Scalar oracle-free duality gap of `x` for `problem` (max over columns).
 
-    Prefers the LASSO duality gap (the literal optimality gap Adelie/glmnet
-    report, so a candidate and the baselines are compared on the *same* y-axis);
-    falls back to the trusted KKT residual for problem types without a dual
-    helper. Like `trusted_kkt`, must be called on the canonical frontend problem.
+    The literal optimality gap Adelie/glmnet report, so a candidate and the
+    baselines are compared on the *same* y-axis. Like `trusted_kkt`, must be
+    called on the canonical frontend problem.
+
+    Raises for problem types without a dual helper rather than silently falling
+    back to the KKT residual: the two rulers have different units and
+    convergence scales, and mixing them on one axis corrupts every comparison
+    made against the curve (a gap panel must be gap end to end).
     """
     x = np.asarray(x, dtype=np.float64)
     if hasattr(problem, "duality_gap_max"):
         return float(problem.duality_gap_max(x))
     if hasattr(problem, "duality_gap"):
         return float(problem.duality_gap(x))
-    return trusted_kkt(problem, x)
+    raise TypeError(
+        f"{type(problem).__name__} exposes no duality gap; refusing to fall "
+        "back to the KKT residual (mixing rulers on one axis). Use trusted_kkt "
+        "for this problem type, or add a duality_gap helper to its frontend."
+    )
 
 
 def time_to_target(points: Iterable[Sequence[float]], tol: float) -> float:

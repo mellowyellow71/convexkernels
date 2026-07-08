@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import numpy as np
+import pytest
 
 from convexkernels.algorithms.gap import lasso_duality_gap, lasso_duality_gap_batched
 from convexkernels.bench.metrics import trusted_gap, trusted_kkt
@@ -64,6 +65,16 @@ def test_trusted_gap_dispatches_to_duality_gap():
     assert abs(trusted_gap(p, x) - p.duality_gap(x)) < 1e-15
     # and it is a different ruler than the KKT residual (both oracle-free)
     assert trusted_gap(p, x) >= 0.0 and trusted_kkt(p, x) >= 0.0
+
+
+def test_trusted_gap_refuses_problems_without_a_dual():
+    # No silent KKT fallback: mixing rulers on one axis was the panel bug.
+    class NoDual:
+        def kkt_residual(self, x):
+            return 0.0
+
+    with pytest.raises(TypeError, match="duality gap"):
+        trusted_gap(NoDual(), np.zeros(3))
 
 
 def test_batched_path_gap():

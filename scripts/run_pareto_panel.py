@@ -55,6 +55,25 @@ def cvxpy_gap_curve(prob, solver, sweep):
     return pts
 
 
+def build_gap_panel(prob, solvers, sweep):
+    """Anytime (wall_time_s, duality_gap) curves for each panel solver.
+
+    Every member — cvxpy-backed and native alike — is built with the SAME
+    ruler (`trusted_gap`); a panel must never mix rulers on one axis. The
+    native solvers go through `baseline_kkt_time_curve(metric=trusted_gap)`,
+    which recomputes the trusted gap on each capped solve's iterate.
+    """
+    from convexkernels.bench.curves import baseline_kkt_time_curve
+
+    panel = {}
+    for s in solvers:
+        if s in ("sklearn", "adelie"):
+            panel[s] = baseline_kkt_time_curve(prob, s, sweep, metric=trusted_gap)
+        else:
+            panel[s] = cvxpy_gap_curve(prob, s, sweep)
+    return panel
+
+
 def candidate_gram_fista_curve(prob, *, max_iters, check_every):
     """numpy FISTA-Gram candidate; returns (cumulative_time_s, gap) checkpoints."""
     A, b = prob.A, prob.b
@@ -105,16 +124,11 @@ def main() -> int:
     solvers = [s.strip() for s in args.solvers.split(",") if s.strip()]
     print(f"LASSO m={prob.m} n={prob.n} lam_frac={args.lam_frac}  panel={solvers}")
 
-    panel = {}
-    for s in solvers:
-        if s == "sklearn":
-            from convexkernels.bench.curves import _sklearn_curve
-            panel[s] = _sklearn_curve(prob, sweep)
-        else:
-            panel[s] = cvxpy_gap_curve(prob, s, sweep)
-        n_ok = len(panel[s])
+    panel = build_gap_panel(prob, solvers, sweep)
+    for s, curve in panel.items():
+        n_ok = len(curve)
         print(f"  baseline {s:9s}: {n_ok} curve points"
-              + (f"  best_gap={min(g for _,g in panel[s]):.1e}" if n_ok else "  (empty)"))
+              + (f"  best_gap={min(g for _,g in curve):.1e}" if n_ok else "  (empty)"))
     if args.adelie_npz and Path(args.adelie_npz).exists():
         d = np.load(args.adelie_npz)
         panel["adelie"] = list(zip(d["t"].tolist(), d["gap"].tolist()))
