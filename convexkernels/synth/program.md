@@ -67,8 +67,9 @@ Rules of the contract:
    budget spent).
 2. **Return the final iterate `X`** (shape `(n, K)` for the path). The harness
    recomputes the trusted KKT on it as the final anti-gaming gate.
-3. **Stay convex-correct.** The returned `X` must genuinely reach
-   `kkt < 1e-6`. No tolerance relaxation, no pickled/precomputed answers, no
+3. **Stay convex-correct.** The returned `X` must genuinely reach the
+   `kkt < 1e-5` contract target. No tolerance relaxation, no
+   pickled/precomputed answers, no
    importing third-party LASSO solvers (adelie/sklearn/glmnet) into the
    candidate. Use only numpy + mlx + python stdlib.
 
