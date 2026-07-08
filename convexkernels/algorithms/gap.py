@@ -24,6 +24,74 @@ from typing import Any, Callable
 import numpy as np
 
 
+def lasso_duality_gap(
+    A: np.ndarray,
+    b: np.ndarray,
+    lam: float,
+    x: np.ndarray,
+    *,
+    scale: float | None = None,
+) -> float:
+    r"""Normalized LASSO duality gap — the oracle-free optimality gap.
+
+    Primal:  P(x) = 1/2 ||A x - b||^2 + lam ||x||_1
+    Dual:    D(theta) = 1/2 ||b||^2 - 1/2 ||b - theta||^2   s.t. ||A^T theta||_inf <= lam
+
+    Given any primal x, the residual ``theta_raw = b - A x`` is the natural dual
+    point; it is rescaled by ``s = min(1, lam / ||A^T theta_raw||_inf)`` to land
+    inside the dual-feasible box (the same construction used by glmnet/Adelie and
+    by SAFE screening). ``P(x) >= D(theta)`` always, so the gap is non-negative
+    and equals zero iff x is the LASSO optimum — no reference solution required,
+    which is exactly why it can be the y-axis for a "beat Adelie" comparison.
+
+    Returns ``(P - D) / scale`` with ``scale = 0.5 ||b||^2 + 1`` by default
+    (mirrors `tv_l2_primal_dual_gap`; the +1 guards tiny ``b`` so this is a
+    normalization, not exact homogeneity under ``(b, lam) -> (alpha b, alpha lam)``).
+    """
+    A = np.asarray(A, dtype=np.float64)
+    b = np.asarray(b, dtype=np.float64)
+    x = np.asarray(x, dtype=np.float64)
+    theta_raw = b - A @ x                       # residual, in R^m
+    dnorm = float(np.max(np.abs(A.T @ theta_raw))) if A.size else 0.0
+    s = min(1.0, lam / dnorm) if dnorm > 0.0 else 1.0
+    theta = s * theta_raw
+    P = 0.5 * float(theta_raw @ theta_raw) + lam * float(np.sum(np.abs(x)))
+    D = 0.5 * float(b @ b) - 0.5 * float((b - theta) @ (b - theta))
+    if scale is None:
+        scale = 0.5 * float(b @ b) + 1.0
+    return float(max(P - D, 0.0)) / scale
+
+
+def lasso_duality_gap_batched(
+    A: np.ndarray,
+    b: np.ndarray,
+    lambdas: np.ndarray,
+    X: np.ndarray,
+    *,
+    scale: float | None = None,
+) -> np.ndarray:
+    """Per-column LASSO duality gap for the batched path; shape ``(K,)``.
+
+    Vectorized `lasso_duality_gap` over the K lambdas of a path (each column of
+    ``X`` is the solution for ``lambdas[k]``). Driver gates / scores on the curve
+    of ``max(per_column_gap)`` vs wall-clock.
+    """
+    A = np.asarray(A, dtype=np.float64)
+    b = np.asarray(b, dtype=np.float64)
+    X = np.asarray(X, dtype=np.float64)
+    lambdas = np.asarray(lambdas, dtype=np.float64)
+    Theta_raw = b[:, None] - A @ X                       # (m, K)
+    dnorm = np.max(np.abs(A.T @ Theta_raw), axis=0)      # (K,)
+    s = np.where(dnorm > 0.0, np.minimum(1.0, lambdas / np.maximum(dnorm, 1e-300)), 1.0)
+    Theta = s[None, :] * Theta_raw
+    P = 0.5 * np.sum(Theta_raw ** 2, axis=0) + lambdas * np.sum(np.abs(X), axis=0)
+    diff = b[:, None] - Theta
+    D = 0.5 * float(b @ b) - 0.5 * np.sum(diff ** 2, axis=0)
+    if scale is None:
+        scale = 0.5 * float(b @ b) + 1.0
+    return np.maximum(P - D, 0.0) / scale
+
+
 def tv_l2_primal_objective(
     b: np.ndarray,
     K_apply: Callable[[np.ndarray], np.ndarray],
