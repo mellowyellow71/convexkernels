@@ -73,12 +73,18 @@ def test_no_panel_reward_is_none():
     assert res["dominates_panel"] is None
 
 
-def test_nadir_widens_with_accepted_points():
+def test_nadir_frozen_after_seed():
+    # The reference is fixed once seeded: a later worse curve must NOT move it,
+    # otherwise session-wide hypervolumes are incomparable and the reward is
+    # inflatable by a nadir-widening curve.
     a = _archive()
     a.seed([(2.0, 1e-2)])
-    a.accept([(50.0, 2.0)])                  # worse than the initial nadir
-    T, G = a.nadir
-    assert T >= 50.0 and G >= 2.0
+    frozen = a.nadir
+    a.accept([(50.0, 2.0)])                  # worse than the frozen nadir
+    assert a.nadir == frozen
+    # and the decision logs the (fixed) reference it was measured against
+    res = a.consider([(1.0, 1e-3)])
+    assert res["nadir"] == frozen
 
 
 def test_nonfinite_and_invalid_points_ignored():

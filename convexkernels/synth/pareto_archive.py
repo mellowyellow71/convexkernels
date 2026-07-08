@@ -45,8 +45,12 @@ class ParetoArchive:
         self.baselines = {k: list(v) for k, v in (baselines or {}).items() if v}
         self.min_advantage = float(min_advantage)
         self._points: list[tuple[float, float]] = []
-        # Fixed reference (worst) point so hypervolumes are comparable across the
-        # whole session. Derived from the baseline panel; widened by seeds later.
+        # Reference (worst) point. Derived from the baseline panel, widened ONCE
+        # by the first seed() to also bound the starting champion's curve, then
+        # FROZEN: every hypervolume/advantage after that is measured against the
+        # same reference, so session-wide numbers are comparable and the reward
+        # cannot be inflated by a later, worse-but-nadir-widening curve.
+        self._frozen = False
         if nadir is not None:
             self._nadir = (float(nadir[0]), float(nadir[1]))
         else:
@@ -58,16 +62,27 @@ class ParetoArchive:
         return self._nadir
 
     def _widen_nadir(self, points: list[Point]) -> None:
-        """Grow the reference point so it stays worse than everything seen."""
+        """Grow the reference point so it stays worse than everything seen.
+
+        No-op once the reference is frozen (after the first seed): the whole
+        point of the fixed reference is that it does not move under later curves.
+        """
+        if self._frozen:
+            return
         T, G = self._nadir
         nt, ng = auto_nadir(points, time=None, gap=None)
         self._nadir = (max(T, nt), max(G, ng))
 
     def seed(self, points: list[Point]) -> None:
-        """Initialise the frontier (e.g. with the starting champion's curve)."""
+        """Initialise the frontier (e.g. with the starting champion's curve).
+
+        This is the last time the reference moves: it widens to bound the seed
+        curve, then freezes for the rest of the session.
+        """
         pts = _clean_points(points)
         self._widen_nadir(pts)
         self._points.extend(pts)
+        self._frozen = True
 
     def frontier(self) -> list[tuple[float, float]]:
         return pareto_front(self._points)
@@ -89,6 +104,7 @@ class ParetoArchive:
         panel = score_against_panel(pts, self.baselines, nadir=self._nadir) if self.baselines else None
         return {
             "accepted": advantage > self.min_advantage,
+            "nadir": self._nadir,               # logged per decision (now fixed)
             "advantage_over_archive": float(advantage),
             "hv_archive_before": float(hv_before),
             "hv_archive_after": float(hv_after),
@@ -98,9 +114,13 @@ class ParetoArchive:
         }
 
     def accept(self, points: list[Point]) -> None:
-        """Commit a candidate curve to the frontier (call after a keep)."""
+        """Commit a candidate curve to the frontier (call after a keep).
+
+        Does NOT move the reference — it was frozen at seed, so accepting a
+        curve cannot retroactively change the hypervolume of earlier decisions.
+        A curve extending past the frozen nadir simply claims no area out there.
+        """
         pts = _clean_points(points)
-        self._widen_nadir(pts)
         self._points.extend(pts)
 
     def summary(self) -> dict:
